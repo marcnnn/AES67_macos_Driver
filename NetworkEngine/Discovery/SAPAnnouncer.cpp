@@ -41,18 +41,37 @@ constexpr uint8_t kSAPTypeDeletionBit     = 0x04;
 // too rather than relying on every receiver implementing the shortcut.
 constexpr const char* kSAPPayloadType = "application/sdp";
 
+uint32_t fnv1a(const std::string& text) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char c : text) {
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 /// RFC 2974 requires the message id hash to change whenever the session
 /// description changes, and to stay put when it does not; receivers use it to
 /// tell a refresh from a modification.
 uint16_t hashSDP(const std::string& sdp) {
-    // FNV-1a, folded to 16 bits.
-    uint32_t hash = 2166136261u;
-    for (unsigned char c : sdp) {
-        hash ^= c;
-        hash *= 16777619u;
-    }
+    const uint32_t hash = fnv1a(sdp);
     uint16_t folded = static_cast<uint16_t>((hash >> 16) ^ (hash & 0xFFFF));
     return folded == 0 ? 1 : folded;  // 0 is reserved for "no hash"
+}
+
+/// The o= line identifies the session, and receivers key off it: same id means
+/// "this is that session again", a different id means "this is a new one".
+///
+/// SDPParser falls back to the wall clock when no id is set, which mints a
+/// fresh identity on every run -- so restarting the driver left receivers
+/// holding a pile of identical-looking sessions that never aged out. Derive it
+/// from what actually identifies the stream instead, so a restart refreshes
+/// the existing session rather than announcing a duplicate.
+uint64_t stableSessionID(const SDPSession& sdp) {
+    const std::string identity = sdp.sessionName + "@" + sdp.connectionAddress +
+                                 ":" + std::to_string(sdp.port);
+    const uint64_t id = fnv1a(identity);
+    return id == 0 ? 1 : id;
 }
 
 } // namespace
@@ -207,6 +226,16 @@ private:
         if (announced.originAddress.empty()) {
             announced.originAddress = sourceAddress_;
         }
+        if (announced.sessionID == 0) {
+            announced.sessionID = stableSessionID(announced);
+        }
+
+        // Version must move when the description does, so a receiver can tell a
+        // modification from a refresh. Derive it from the content for the same
+        // reason the id is derived from the identity: it has to survive a
+        // restart without inventing a new session.
+        const std::string body = SDPParser::generate(announced);
+        announced.sessionVersion = fnv1a(body);
         return SDPParser::generate(announced);
     }
 
