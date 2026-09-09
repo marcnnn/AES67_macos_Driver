@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <cstdint>
 
 namespace AES67 {
 
@@ -18,6 +19,19 @@ public:
      * @return true if successful, false otherwise
      */
     static bool configureForRealTime();
+
+    /// Join the real-time scheduling class for a thread that must wake on a
+    /// fixed period, such as a packet transmit loop.
+    ///
+    /// configureForRealTime() only marks a thread as non-timeshared and raises
+    /// its precedence, which leaves it competing normally for the CPU; a 1ms
+    /// wakeup can then land milliseconds late under load. This additionally
+    /// installs a time-constraint policy, which is what actually tells the
+    /// macOS scheduler to run the thread on a deadline.
+    ///
+    /// @param periodNs      How often the thread must wake.
+    /// @param computationNs Roughly how long its work takes each period.
+    static bool configureForRealTimePeriodic(uint64_t periodNs, uint64_t computationNs);
     
     /**
      * Configure a specific thread for real-time audio processing

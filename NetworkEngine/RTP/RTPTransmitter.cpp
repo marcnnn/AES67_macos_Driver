@@ -98,7 +98,15 @@ bool RTPTransmitter::start() {
     // that amount.
     running_ = true;
     transmitThread_ = std::thread([this]() {
-        if (!AudioThreadPriority::configureForRealTime()) {
+        // Ask for deadline scheduling on the packet cadence. Marking the
+        // thread non-timeshared is not enough on its own: it still competes
+        // for the CPU normally, and a 1ms wakeup then lands milliseconds late
+        // under load, which a receiver counts as a late packet.
+        const uint64_t periodNs =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                packetInterval_).count());
+        if (periodNs == 0 ||
+            !AudioThreadPriority::configureForRealTimePeriodic(periodNs, periodNs / 4)) {
             AES67_LOGF("RTPTransmitter: failed to set RT priority on transmit thread (stream=%s)",
                        sdp_.sessionName.c_str());
         }

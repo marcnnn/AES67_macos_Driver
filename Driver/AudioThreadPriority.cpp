@@ -8,11 +8,58 @@
 #include <errno.h>
 #include <cstring>
 #include <cstdio>
+#include <mach/mach_time.h>
+#include <algorithm>
 
 namespace AES67 {
 
 bool AudioThreadPriority::configureForRealTime() {
     return configureThreadForRealTime(pthread_self());
+}
+
+bool AudioThreadPriority::configureForRealTimePeriodic(uint64_t periodNs,
+                                                       uint64_t computationNs) {
+    // Start from the existing configuration so the thread is also taken out of
+    // the timeshare class; the time-constraint policy below is what actually
+    // gets it scheduled on a deadline.
+    configureForRealTime();
+
+    mach_timebase_info_data_t timebase{};
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0) {
+        return false;
+    }
+
+    // Policy values are in mach absolute time units, not nanoseconds.
+    const double ticksPerNs = static_cast<double>(timebase.denom) /
+                              static_cast<double>(timebase.numer);
+
+    // Never claim more computation than the period, or the scheduler cannot
+    // satisfy the request and rejects it outright.
+    computationNs = std::min(computationNs, periodNs);
+
+    thread_time_constraint_policy_data_t policy;
+    policy.period      = static_cast<uint32_t>(periodNs * ticksPerNs);
+    policy.computation = static_cast<uint32_t>(computationNs * ticksPerNs);
+    // Deadline: the work must be finished within the period, otherwise the
+    // next wakeup is already due.
+    policy.constraint  = static_cast<uint32_t>(periodNs * ticksPerNs);
+    policy.preemptible = 0;
+
+    const kern_return_t result = thread_policy_set(
+        pthread_mach_thread_np(pthread_self()),
+        THREAD_TIME_CONSTRAINT_POLICY,
+        reinterpret_cast<thread_policy_t>(&policy),
+        THREAD_TIME_CONSTRAINT_POLICY_COUNT
+    );
+
+    if (result != KERN_SUCCESS) {
+        fprintf(stderr, "AES67 AudioThreadPriority: THREAD_TIME_CONSTRAINT_POLICY "
+                        "failed (kern_return=%d: %s)\n",
+                result, mach_error_string(result));
+        return false;
+    }
+
+    return true;
 }
 
 bool AudioThreadPriority::configureThreadForRealTime(pthread_t thread) {
