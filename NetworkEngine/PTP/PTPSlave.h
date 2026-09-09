@@ -161,6 +161,26 @@ struct PTPSlaveConfig {
     int announceTimeoutMultiplier = 3;           // Announce receipt timeout multiplier
     int announceIntervalMs = 1000;               // Expected announce interval
     bool twoStepOnly = true;                     // Only accept two-step clocks (AES67)
+
+    // AES67 media clock recovery does not require the master and the local
+    // system clock to share an epoch, and plenty of hardware does not share
+    // one: Dante devices (a Behringer WING among them) run PTP from an
+    // arbitrary epoch, usually close to their own uptime. Differencing those
+    // timestamps against CLOCK_REALTIME gives a raw offset of decades, which
+    // no lock detector can converge on and which overflows the filters.
+    //
+    // When true, the first valid measurement establishes a baseline and the
+    // reported offset is the residual relative to it. That residual is what
+    // media clock recovery actually needs — relative rate and stability, not
+    // absolute wall-clock agreement.
+    bool normalizeEpoch = true;
+
+    // A difference larger than this is treated as an epoch difference rather
+    // than a genuine clock offset. Anything under it is left alone, so a
+    // master that does share our epoch still reports its true offset; only
+    // implausible differences are normalised away. The same threshold detects
+    // a master that steps its clock or restarts its epoch mid-session.
+    int64_t epochThresholdNs = 1000000000LL;   // 1 s
 };
 
 // ============================================================================
@@ -206,6 +226,18 @@ public:
     uint8_t getClockClass() const { return clockClass_.load(std::memory_order_acquire); }
     uint8_t getClockAccuracy() const { return clockAccuracy_.load(std::memory_order_acquire); }
 
+    // --- Epoch normalisation (see PTPSlaveConfig::normalizeEpoch) ---
+
+    // True once a baseline has been established from the first measurement.
+    bool hasEpochBaseline() const { return epochBaselineValid_.load(std::memory_order_acquire); }
+
+    // The master/local epoch difference that is being subtracted out. Zero for
+    // a master that shares our epoch; for the WING it is decades.
+    int64_t getEpochBaselineNs() const { return epochBaselineNs_.load(std::memory_order_acquire); }
+
+    // The un-normalised offset, for diagnostics.
+    int64_t getRawOffsetNs() const { return rawOffsetNs_.load(std::memory_order_acquire); }
+
     // Set callback for measurement updates
     void setMeasurementCallback(PTPMeasurementCallback cb);
 
@@ -242,8 +274,17 @@ private:
     // Offset/delay calculation
     void calculateOffsetAndDelay();
 
+    // Discard the epoch baseline and the filter history that was accumulated
+    // against it, so the next measurement re-establishes both.
+    void resetEpochBaseline();
+
     // Get current system time in nanoseconds
     static uint64_t getSystemTimeNs();
+
+    // Monotonic time, for measuring elapsed intervals. Unlike getSystemTimeNs()
+    // this cannot be stepped by NTP, which would otherwise corrupt the drift
+    // estimate.
+    static uint64_t getMonotonicTimeNs();
 
     // Get MAC address of the configured interface
     bool getInterfaceMAC(uint8_t mac[6]) const;
@@ -304,6 +345,13 @@ private:
 
     // Grandmaster identity (protected by masterMutex_)
     PTPClockIdentity grandmasterIdentity_;
+
+    // Epoch normalisation state. rawOffsetNs_ is the offset as computed
+    // straight from the PTP timestamps; epochBaselineNs_ is the constant
+    // epoch difference subtracted from it to produce offsetNs_.
+    std::atomic<int64_t> rawOffsetNs_{0};
+    std::atomic<int64_t> epochBaselineNs_{0};
+    std::atomic<bool> epochBaselineValid_{false};
 
     // Offset filtering — simple moving average
     static constexpr size_t kOffsetFilterSize = 8;

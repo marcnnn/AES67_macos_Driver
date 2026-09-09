@@ -170,7 +170,7 @@ bool PTPSlave::start() {
     offsetHistoryIndex_ = 0;
     delayHistoryCount_ = 0;
     delayHistoryIndex_ = 0;
-    lastDriftCalcTimeNs_ = 0;
+    resetEpochBaseline();
     syncCount_.store(0, std::memory_order_relaxed);
     followUpCount_.store(0, std::memory_order_relaxed);
     delayReqSentCount_.store(0, std::memory_order_relaxed);
@@ -805,9 +805,12 @@ void PTPSlave::handleAnnounce(const PTPHeader& header, const uint8_t* data, size
             clockClass_.store(announce.grandmasterClockClass, std::memory_order_release);
             clockAccuracy_.store(announce.grandmasterClockAccuracy, std::memory_order_release);
 
-            // Reset lock on master change
+            // Reset lock on master change. The new master has its own epoch,
+            // so the old baseline and the filter history built against it are
+            // both meaningless now.
             locked_.store(false, std::memory_order_release);
             consecutiveGoodMeasurements_ = 0;
+            resetEpochBaseline();
         } else if (announce.grandmasterIdentity == grandmasterIdentity_) {
             // Same master, refresh timeout
             currentMaster_.lastReceived = announce.lastReceived;
@@ -893,6 +896,19 @@ bool PTPSlave::sendDelayReq() {
 // Offset and Delay Calculation
 // ============================================================================
 
+void PTPSlave::resetEpochBaseline() {
+    // Only ever called from the receive thread (or before it starts), so the
+    // non-atomic filter state below needs no additional locking.
+    epochBaselineValid_.store(false, std::memory_order_release);
+    epochBaselineNs_.store(0, std::memory_order_release);
+    rawOffsetNs_.store(0, std::memory_order_release);
+    frequencyDriftPpb_.store(0.0, std::memory_order_release);
+    offsetHistoryCount_ = 0;
+    offsetHistoryIndex_ = 0;
+    lastDriftCalcTimeNs_ = 0;
+    lastDriftCalcOffsetNs_ = 0;
+}
+
 void PTPSlave::calculateOffsetAndDelay() {
     // We need t1, t2 to compute offset (using existing delay estimate).
     // When we also have t3, t4 we compute the full offset+delay.
@@ -962,23 +978,89 @@ void PTPSlave::calculateOffsetAndDelay() {
         offset = (t2SignedNs - t1Ns) - storedDelay;
     }
 
+    // The raw offset carries any difference between the master's PTP epoch and
+    // our system clock epoch. Keep it for diagnostics before normalising.
+    rawOffsetNs_.store(offset, std::memory_order_release);
+
+    if (config_.normalizeEpoch) {
+        if (!epochBaselineValid_.load(std::memory_order_acquire)) {
+            // The first usable measurement decides whether the master shares
+            // our epoch. Only an implausibly large difference is treated as an
+            // epoch difference — a small one is a real offset worth reporting.
+            const bool differentEpoch = (offset > config_.epochThresholdNs ||
+                                         offset < -config_.epochThresholdNs);
+            const int64_t baseline = differentEpoch ? offset : 0;
+
+            epochBaselineNs_.store(baseline, std::memory_order_release);
+            epochBaselineValid_.store(true, std::memory_order_release);
+            offsetHistoryCount_ = 0;
+            offsetHistoryIndex_ = 0;
+            lastDriftCalcTimeNs_ = 0;
+
+            if (differentEpoch) {
+                std::cout << "[PTPSlave] Master uses a different epoch: "
+                          << (baseline / 1000000000LL)
+                          << "s from the system clock — normalising it out"
+                          << std::endl;
+            } else {
+                std::cout << "[PTPSlave] Master shares the system clock epoch "
+                          << "(initial offset " << offset << "ns)" << std::endl;
+            }
+        } else {
+            const int64_t baseline = epochBaselineNs_.load(std::memory_order_acquire);
+
+            // Compare against the baseline without overflowing: both values are
+            // the same magnitude by construction, but a master that restarts its
+            // epoch can put them far apart, so difference them as unsigned.
+            const uint64_t spread =
+                static_cast<uint64_t>(offset) - static_cast<uint64_t>(baseline);
+            const int64_t residual = static_cast<int64_t>(spread);
+
+            if (residual > config_.epochThresholdNs ||
+                residual < -config_.epochThresholdNs) {
+                // The master stepped its clock or restarted. Re-baseline rather
+                // than reporting an offset the lock detector can never satisfy.
+                epochBaselineNs_.store(offset, std::memory_order_release);
+                offsetHistoryCount_ = 0;
+                offsetHistoryIndex_ = 0;
+                lastDriftCalcTimeNs_ = 0;
+                locked_.store(false, std::memory_order_release);
+                consecutiveGoodMeasurements_ = 0;
+
+                std::cout << "[PTPSlave] Master epoch changed (jump of "
+                          << residual << "ns) — re-baselining" << std::endl;
+            }
+        }
+
+        const uint64_t normalised = static_cast<uint64_t>(offset) -
+                                    static_cast<uint64_t>(epochBaselineNs_.load(std::memory_order_acquire));
+        offset = static_cast<int64_t>(normalised);
+    }
+
     // Filter offset (moving average)
     offsetHistory_[offsetHistoryIndex_] = offset;
     offsetHistoryIndex_ = (offsetHistoryIndex_ + 1) % kOffsetFilterSize;
     if (offsetHistoryCount_ < kOffsetFilterSize) offsetHistoryCount_++;
 
-    // Compute filtered offset (average)
-    int64_t filteredOffset = 0;
+    // Compute filtered offset (average). Sum the deviations from the first
+    // sample rather than the samples themselves: with epoch normalisation
+    // disabled the raw values can be ~1e18ns, and summing eight of those
+    // overflows int64 and flips the sign of the result.
+    const int64_t offsetRef = offsetHistory_[0];
+    int64_t offsetAcc = 0;
     for (size_t i = 0; i < offsetHistoryCount_; ++i) {
-        filteredOffset += offsetHistory_[i];
+        offsetAcc += offsetHistory_[i] - offsetRef;
     }
-    filteredOffset /= static_cast<int64_t>(offsetHistoryCount_);
+    int64_t filteredOffset =
+        offsetRef + offsetAcc / static_cast<int64_t>(offsetHistoryCount_);
 
     // Store computed offset
     offsetNs_.store(filteredOffset, std::memory_order_release);
 
-    // Drift estimation
-    uint64_t nowNs = getSystemTimeNs();
+    // Drift estimation. Measure the interval on the monotonic clock:
+    // CLOCK_REALTIME can be stepped by NTP mid-measurement, which would show up
+    // as a huge spurious drift.
+    uint64_t nowNs = getMonotonicTimeNs();
     if (lastDriftCalcTimeNs_ != 0) {
         uint64_t dtNs = nowNs - lastDriftCalcTimeNs_;
         if (dtNs > 500000000ULL) { // Update drift every 500ms minimum
@@ -1050,6 +1132,13 @@ void PTPSlave::calculateOffsetAndDelay() {
 uint64_t PTPSlave::getSystemTimeNs() {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
+           static_cast<uint64_t>(ts.tv_nsec);
+}
+
+uint64_t PTPSlave::getMonotonicTimeNs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
            static_cast<uint64_t>(ts.tv_nsec);
 }
