@@ -637,6 +637,20 @@ bool StreamManager::validateNetworkConfig(const SDPSession& sdp, std::string* er
         return false;
     }
 
+    // Dante receivers only accept AES67 streams whose multicast address falls
+    // inside the prefix configured in their AES67 settings, which defaults to
+    // 239.69.0.0/16. A stream outside it is discovered and listed normally,
+    // and then silently refuses to subscribe -- the receiver never even joins
+    // the group, so it looks like a network fault rather than a rejection.
+    // Warn rather than reject: the prefix is configurable, and other AES67
+    // receivers have no such restriction.
+    if (sdp.connectionAddress.substr(0, 7) != "239.69.") {
+        AES67_LOGF("StreamManager: multicast %s is outside 239.69.0.0/16; Dante "
+                   "receivers will list this stream but refuse to subscribe "
+                   "unless their AES67 multicast prefix is changed to match",
+                   sdp.connectionAddress.c_str());
+    }
+
     if (sdp.port == 0) {
         if (errorOut) {
             *errorOut = "Invalid port: 0";
