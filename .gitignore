@@ -71,3 +71,7 @@ ManagerApp/.build/
 
 # Serena plugin
 .serena/
+
+# Local build output and vendored dependency checkout
+/build/
+/external/

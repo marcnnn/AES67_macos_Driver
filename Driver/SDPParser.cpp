@@ -330,18 +330,48 @@ bool SDPParser::parseSourceFilterAttribute(const std::string& value, SDPSession&
 }
 
 bool SDPParser::parsePTPRefClockAttribute(const std::string& value, SDPSession& session) {
-    // Format: ptp=IEEE1588-2008:<mac-address>:domain-nmbr=<domain>
-    // Example: ptp=IEEE1588-2008:00-1B-21-AC-B5-4F:domain-nmbr=0
-    std::regex ptpRegex(R"(ptp=IEEE1588-2008:([0-9A-Fa-f\-:]+):domain-nmbr=(\d+))");
+    // ts-refclk carries the PTP grandmaster the stream is clocked to. Two
+    // spellings of the domain are in the wild and both must be accepted:
+    //
+    //   ptp=IEEE1588-2008:00-1B-21-AC-B5-4F:domain-nmbr=0   (Riedel Artist)
+    //   ptp=IEEE1588-2008:00-1D-C1-FF-FE-D1-7B-F3:0         (Dante, e.g. WING)
+    //
+    // The domain may also be omitted entirely, in which case it defaults to 0.
+    // Note the grandmaster id is an EUI-64 for IEEE1588-2008, so it is eight
+    // groups rather than six -- matching on group count would be wrong.
     std::smatch match;
 
-    if (std::regex_search(value, match, ptpRegex)) {
+    static const std::regex ptpNamedDomain(
+        R"(ptp=IEEE1588-2008:([0-9A-Fa-f\-]+):domain-nmbr=(\d+))");
+    if (std::regex_search(value, match, ptpNamedDomain)) {
         session.ptpMasterMAC = match[1];
         session.ptpDomain = std::stoi(match[2]);
         return true;
     }
 
-    return false;
+    static const std::regex ptpBareDomain(
+        R"(ptp=IEEE1588-2008:([0-9A-Fa-f\-]+):(\d+))");
+    if (std::regex_search(value, match, ptpBareDomain)) {
+        session.ptpMasterMAC = match[1];
+        session.ptpDomain = std::stoi(match[2]);
+        return true;
+    }
+
+    static const std::regex ptpNoDomain(R"(ptp=IEEE1588-2008:([0-9A-Fa-f\-]+))");
+    if (std::regex_search(value, match, ptpNoDomain)) {
+        session.ptpMasterMAC = match[1];
+        session.ptpDomain = 0;
+        return true;
+    }
+
+    // Anything else -- ts-refclk:localmac=..., a PTP version we do not know,
+    // some vendor extension. We cannot identify the clock, but the stream is
+    // still perfectly receivable, so record that there is no usable PTP
+    // reference rather than rejecting the entire session description over one
+    // attribute.
+    session.ptpDomain = -1;
+    session.ptpMasterMAC.clear();
+    return true;
 }
 
 bool SDPParser::parseMediaClockAttribute(const std::string& value, SDPSession& session) {
