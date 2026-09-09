@@ -640,24 +640,34 @@ void PTPSlave::handleSync(const PTPHeader& header, const uint8_t* data, size_t l
 
     bool isTwoStep = (header.flagField & kFlagTwoStep) != 0;
 
-    std::lock_guard<std::mutex> lock(syncMutex_);
+    bool canCalculate = false;
 
-    // Store t2 (our receive timestamp)
-    t2_receiveTimeNs_ = receiveTimeNs;
-    lastSyncSequenceId_ = header.sequenceId;
-    syncCorrectionField_ = header.correctionField;
+    {
+        std::lock_guard<std::mutex> lock(syncMutex_);
 
-    if (isTwoStep) {
-        // Two-step: wait for Follow_Up with the precise t1
-        waitingForFollowUp_ = true;
-        // Parse origin timestamp from Sync (informational only in two-step)
-        parseTimestamp(data, kTimestampOffset, syncOriginTimestamp_);
-    } else {
-        // One-step: origin timestamp in Sync IS t1
-        parseTimestamp(data, kTimestampOffset, t1_syncOriginTimestamp_);
-        waitingForFollowUp_ = false;
+        // Store t2 (our receive timestamp)
+        t2_receiveTimeNs_ = receiveTimeNs;
+        lastSyncSequenceId_ = header.sequenceId;
+        syncCorrectionField_ = header.correctionField;
 
-        // Can compute offset immediately with existing delay
+        if (isTwoStep) {
+            // Two-step: wait for Follow_Up with the precise t1
+            waitingForFollowUp_ = true;
+            // Parse origin timestamp from Sync (informational only in two-step)
+            parseTimestamp(data, kTimestampOffset, syncOriginTimestamp_);
+        } else {
+            // One-step: origin timestamp in Sync IS t1
+            parseTimestamp(data, kTimestampOffset, t1_syncOriginTimestamp_);
+            waitingForFollowUp_ = false;
+
+            // Can compute offset immediately with existing delay
+            canCalculate = true;
+        }
+    }
+
+    // calculateOffsetAndDelay() takes syncMutex_ and delayMutex_ itself, so it
+    // must be called with both released.
+    if (canCalculate) {
         calculateOffsetAndDelay();
     }
 }
@@ -667,30 +677,34 @@ void PTPSlave::handleFollowUp(const PTPHeader& header, const uint8_t* data, size
 
     followUpCount_.fetch_add(1, std::memory_order_relaxed);
 
-    std::lock_guard<std::mutex> lock(syncMutex_);
+    {
+        std::lock_guard<std::mutex> lock(syncMutex_);
 
-    // Follow_Up must match the Sync we're waiting for
-    if (!waitingForFollowUp_) return;
-    if (header.sequenceId != lastSyncSequenceId_) return;
+        // Follow_Up must match the Sync we're waiting for
+        if (!waitingForFollowUp_) return;
+        if (header.sequenceId != lastSyncSequenceId_) return;
 
-    // Parse the precise origin timestamp (t1)
-    parseTimestamp(data, kTimestampOffset, t1_syncOriginTimestamp_);
+        // Parse the precise origin timestamp (t1)
+        parseTimestamp(data, kTimestampOffset, t1_syncOriginTimestamp_);
 
-    // Add Follow_Up correction to Sync correction
-    // Both are in nanoseconds * 2^16 fixed point
-    int64_t totalCorrectionFixed = syncCorrectionField_ + header.correctionField;
+        // Add Follow_Up correction to Sync correction
+        // Both are in nanoseconds * 2^16 fixed point
+        int64_t totalCorrectionFixed = syncCorrectionField_ + header.correctionField;
 
-    // Convert correction from fixed-point (ns * 2^16) to nanoseconds
-    int64_t correctionNs = totalCorrectionFixed >> 16;
+        // Convert correction from fixed-point (ns * 2^16) to nanoseconds
+        int64_t correctionNs = totalCorrectionFixed >> 16;
 
-    // Apply correction to t1
-    uint64_t t1Ns = t1_syncOriginTimestamp_.toNanoseconds();
-    t1Ns += static_cast<uint64_t>(correctionNs);
-    t1_syncOriginTimestamp_ = PTPTimestamp(t1Ns);
+        // Apply correction to t1
+        uint64_t t1Ns = t1_syncOriginTimestamp_.toNanoseconds();
+        t1Ns += static_cast<uint64_t>(correctionNs);
+        t1_syncOriginTimestamp_ = PTPTimestamp(t1Ns);
 
-    waitingForFollowUp_ = false;
+        waitingForFollowUp_ = false;
+    }
 
-    // Now we have t1 and t2 — compute offset (using existing path delay)
+    // Now we have t1 and t2 — compute offset (using existing path delay).
+    // calculateOffsetAndDelay() re-acquires syncMutex_, so the lock above must
+    // be released before calling it.
     calculateOffsetAndDelay();
 }
 
@@ -699,36 +713,33 @@ void PTPSlave::handleDelayResp(const PTPHeader& header, const uint8_t* data, siz
 
     delayRespCount_.fetch_add(1, std::memory_order_relaxed);
 
-    std::lock_guard<std::mutex> lock(delayMutex_);
-
-    // Must match our Delay_Req
-    if (!waitingForDelayResp_) return;
-    if (header.sequenceId != delayReqSequenceId_) return;
-
-    // Verify the requesting port identity matches ours (bytes 44-53)
-    PTPPortIdentity requestingPort;
-    parsePortIdentity(data, 44, requestingPort);
-    if (!(requestingPort == selfPortId_)) return;
-
-    // Parse t4 (master's receive timestamp of our Delay_Req)
-    parseTimestamp(data, kTimestampOffset, t4_delayRespReceiveTimestamp_);
-
-    // Apply correction field
-    int64_t correctionNs = header.correctionField >> 16;
-    uint64_t t4Ns = t4_delayRespReceiveTimestamp_.toNanoseconds();
-    t4Ns += static_cast<uint64_t>(correctionNs);
-    t4_delayRespReceiveTimestamp_ = PTPTimestamp(t4Ns);
-
-    waitingForDelayResp_ = false;
-
-    // Now we have all four timestamps — recalculate with full path delay
     {
-        // Need sync mutex too for the full calculation
-        // But we already hold delayMutex_, so acquire syncMutex_ carefully
-        // Actually the calculation function acquires its own locks, so we release delay first
+        std::lock_guard<std::mutex> lock(delayMutex_);
+
+        // Must match our Delay_Req
+        if (!waitingForDelayResp_) return;
+        if (header.sequenceId != delayReqSequenceId_) return;
+
+        // Verify the requesting port identity matches ours (bytes 44-53)
+        PTPPortIdentity requestingPort;
+        parsePortIdentity(data, 44, requestingPort);
+        if (!(requestingPort == selfPortId_)) return;
+
+        // Parse t4 (master's receive timestamp of our Delay_Req)
+        parseTimestamp(data, kTimestampOffset, t4_delayRespReceiveTimestamp_);
+
+        // Apply correction field
+        int64_t correctionNs = header.correctionField >> 16;
+        uint64_t t4Ns = t4_delayRespReceiveTimestamp_.toNanoseconds();
+        t4Ns += static_cast<uint64_t>(correctionNs);
+        t4_delayRespReceiveTimestamp_ = PTPTimestamp(t4Ns);
+
+        waitingForDelayResp_ = false;
     }
 
-    // Calculate with new delay information
+    // Now we have all four timestamps — recalculate with full path delay.
+    // calculateOffsetAndDelay() acquires delayMutex_ itself, so the lock above
+    // must be released before calling it.
     calculateOffsetAndDelay();
 }
 
