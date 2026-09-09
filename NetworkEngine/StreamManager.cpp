@@ -706,13 +706,14 @@ std::unique_ptr<RTPTransmitter> StreamManager::createTransmitter(
     // Derive RTP timestamps from the grandmaster's clock. A receiver uses them
     // to place our samples on its own playout timeline, so without this the
     // stream decodes but is reported as carrying no data.
-    if (ptpManager_) {
-        auto manager = ptpManager_;
-        SDPSession sdpCopy = sdp;
-        transmitter->setMediaClockSource([manager, sdpCopy]() -> uint64_t {
-            return manager->getMasterTimeForStream(sdpCopy);
-        });
-    }
+    SDPSession sdpCopy = sdp;
+    transmitter->setMediaClockSource([sdpCopy]() -> uint64_t {
+        // PTPClockManager is a singleton and outlives every stream, so the
+        // lambda can reach it directly. The member this used to go through was
+        // never assigned, so the clock source was never installed and every
+        // transmitted stream carried timestamps starting from zero.
+        return PTPClockManager::getInstance().getMasterTimeForStream(sdpCopy);
+    });
 
     return transmitter;
 }
@@ -805,6 +806,11 @@ bool StreamManager::loadSavedStreams() {
         managed.sdp = config.sdp;
         managed.mapping = config.mapping;
         managed.isTransmit = (config.sdp.direction == "sendonly" || config.sdp.direction == "sendrecv");
+        // Needed by the SAP announcer to advertise from the same interface the
+        // stream transmits on; without it a saved TX stream would be announced
+        // via the default route, which on a multi-homed host is the wrong
+        // network and reaches none of the receivers that matter.
+        managed.networkInterface = config.networkInterface;
 
         // Create RTP receiver or transmitter (only start if IO is active)
         if (managed.isTransmit) {

@@ -200,16 +200,40 @@ void RTPTransmitter::transmitLoop() {
         // out of it. Deriving each packet's send instant from the media clock
         // directly leaves nothing to accumulate.
         if (mediaClockSource_) {
+            // PTP may not have locked when the stream started -- it takes a few
+            // seconds -- so anchor on the first reading that is actually
+            // available rather than being stuck with an unusable zero anchor
+            // for the life of the stream.
+            if (mediaTicks_ == 0) {
+                const uint64_t anchor = computeInitialMediaTicks();
+                if (anchor != 0) {
+                    mediaTicks_ = anchor;
+                    timestamp_ = static_cast<uint32_t>(mediaTicks_ & 0xFFFFFFFFULL);
+                }
+            }
+
             const uint64_t targetNs = mediaTicksToNs(mediaTicks_);
             const uint64_t nowNs = mediaClockSource_();
 
-            if (nowNs != 0 && targetNs > nowNs + sendAheadNs) {
-                const uint64_t waitNs = targetNs - nowNs - sendAheadNs;
-                // A wait longer than a moment means the clock jumped; fall
-                // through and send rather than stalling the stream.
-                if (waitNs < 100000000ULL) {
-                    std::this_thread::sleep_for(std::chrono::nanoseconds(waitNs));
+            if (nowNs == 0) {
+                // No PTP lock. Fall back to the local schedule: without this
+                // the loop has nothing to wait on and spins, sending flat out
+                // and burning a core, which is far worse than a stream whose
+                // timestamps are merely not yet aligned.
+                std::this_thread::sleep_until(nextTransmitTime);
+                nextTransmitTime += packetInterval_;
+            } else {
+                if (targetNs > nowNs + sendAheadNs) {
+                    const uint64_t waitNs = targetNs - nowNs - sendAheadNs;
+                    // A wait longer than a moment means the clock jumped; fall
+                    // through and send rather than stalling the stream.
+                    if (waitNs < 100000000ULL) {
+                        std::this_thread::sleep_for(std::chrono::nanoseconds(waitNs));
+                    }
                 }
+                // Keep the fallback schedule tracking real time, so switching
+                // to it later does not resume from a stale point.
+                nextTransmitTime = std::chrono::steady_clock::now() + packetInterval_;
             }
         } else {
             // No media clock: keep the fixed local schedule.
