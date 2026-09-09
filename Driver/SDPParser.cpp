@@ -404,6 +404,12 @@ std::string SDPParser::generate(const SDPSession& session) {
     // Timing
     sdp << "t=" << session.timeStart << " " << session.timeStop << "\n";
 
+    // Direction, at session level. It is legal either side of the m= line, but
+    // AES67 hardware announces it here -- the WING and every other sender
+    // observed on the wire do -- and a receiver deciding whether it may
+    // subscribe is the one that has to agree with us.
+    sdp << "a=" << session.direction << "\n";
+
     // Media
     sdp << generateMediaLine(session) << "\n";
 
@@ -470,11 +476,11 @@ std::vector<std::string> SDPParser::generateAttributes(const SDPSession& session
     // ptime
     attributes.push_back("a=ptime:" + std::to_string(session.ptime));
 
-    // framecount
-    attributes.push_back("a=framecount:" + std::to_string(session.framecount));
+    // framecount is not emitted: it is redundant with ptime, which every AES67
+    // receiver already requires, and no observed hardware sends it. Keep the
+    // announcement to the attributes real devices exchange.
 
-    // direction
-    attributes.push_back("a=" + session.direction);
+    // Direction is written at session level -- see generate().
 
     // source-filter
     if (!session.sourceAddress.empty()) {
