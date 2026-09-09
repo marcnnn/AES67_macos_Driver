@@ -30,13 +30,17 @@ struct SDPSession {
     // Origin
     std::string originUsername{"-"};       // o= (username, usually "-")
     std::string originAddress;             // o= (unicast address)
-    std::string originAddressType{"IN"};   // o= (usually "IN")
-    std::string originNetworkType{"IP4"};  // o= (usually "IP4")
+    // o= carries <nettype> <addrtype>, in that order: "IN IP4". Keep the
+    // defaults matching the names -- generateOriginLine() writes networkType
+    // first, so swapping these emits "IP4 IN" for any session built by hand
+    // rather than parsed, which is every transmit stream we announce.
+    std::string originNetworkType{"IN"};   // o= (nettype, "IN")
+    std::string originAddressType{"IP4"};  // o= (addrtype, "IP4")
 
     // Connection (c=)
     std::string connectionAddress;   // Usually multicast IP
-    std::string connectionType{"IN"};
-    std::string connectionNetwork{"IP4"};
+    std::string connectionType{"IN"};      // c= (nettype)
+    std::string connectionNetwork{"IP4"};  // c= (addrtype)
     uint8_t ttl{32};                // TTL for multicast
 
     // Timing (t=)

@@ -17,11 +17,13 @@ namespace AES67 {
 StreamManager::StreamManager(DeviceChannelBuffers& inputChannels, DeviceChannelBuffers& outputChannels)
     : inputChannels_(inputChannels)
     , outputChannels_(outputChannels)
+    , sapAnnouncer_(std::make_unique<SAPAnnouncer>())
     , configManager_(std::make_unique<StreamConfigManager>())
 {
 }
 
 StreamManager::~StreamManager() {
+    stopAnnouncingTxStreams();
     removeAllStreams();
 }
 
@@ -183,6 +185,12 @@ bool StreamManager::removeStream(const StreamID& id) {
     // Save info for callback before deletion
     StreamInfo info = it->second.info;
 
+    // Withdraw the announcement first so nobody subscribes to a stream that is
+    // about to stop transmitting.
+    if (it->second.isTransmit && sapAnnouncer_) {
+        sapAnnouncer_->removeSession(id);
+    }
+
     // Stop receiver/transmitter
     if (it->second.receiver) {
         it->second.receiver->stop();
@@ -234,7 +242,8 @@ StreamID StreamManager::createTxStream(
     const std::string& multicastIP,
     uint16_t port,
     uint16_t numChannels,
-    const ChannelMapping& mapping
+    const ChannelMapping& mapping,
+    const std::string& networkInterface
 ) {
     std::lock_guard<std::mutex> lock(streamsMutex_);
 
@@ -280,9 +289,10 @@ StreamID StreamManager::createTxStream(
     managed.sdp = sdp;
     managed.mapping = completeMapping;
     managed.isTransmit = true;
+    managed.networkInterface = networkInterface;
 
     // Create RTP transmitter
-    managed.transmitter = createTransmitter(sdp, completeMapping);
+    managed.transmitter = createTransmitter(sdp, completeMapping, networkInterface);
     if (!managed.transmitter) {
         AES67_LOGF("StreamManager::createTxStream: failed to create RTP transmitter for '%s'",
                    name.c_str());
@@ -488,8 +498,12 @@ void StreamManager::setIOActive(bool active) {
                 managed.transmitter->start();
             }
         }
+        startAnnouncingTxStreams();
     } else {
         AES67_LOGF("StreamManager::setIOActive: Stopping %zu stream(s)", streams_.size());
+        // Withdraw the announcements before the transmitters go quiet, so a
+        // receiver drops the subscription rather than sitting on a dead stream.
+        stopAnnouncingTxStreams();
         for (auto& [id, managed] : streams_) {
             if (managed.receiver) {
                 managed.receiver->stop();
@@ -498,6 +512,50 @@ void StreamManager::setIOActive(bool active) {
                 managed.transmitter->stop();
             }
         }
+    }
+}
+
+void StreamManager::startAnnouncingTxStreams() {
+    // Caller holds streamsMutex_.
+    if (!sapAnnouncer_) {
+        return;
+    }
+
+    // Announce from the same interface the transmitters send on; on a
+    // multi-homed host an announcement on the wrong network reaches nobody.
+    std::string announceInterface;
+    size_t txCount = 0;
+    for (const auto& [id, managed] : streams_) {
+        if (!managed.isTransmit) {
+            continue;
+        }
+        txCount++;
+        if (announceInterface.empty()) {
+            announceInterface = managed.networkInterface;
+        }
+    }
+
+    if (txCount == 0) {
+        return; // Nothing to advertise
+    }
+
+    if (!sapAnnouncer_->isRunning() && !sapAnnouncer_->start(announceInterface)) {
+        AES67_LOG("StreamManager: failed to start SAP announcer; TX streams will "
+                  "not be discoverable");
+        return;
+    }
+
+    for (const auto& [id, managed] : streams_) {
+        if (managed.isTransmit) {
+            sapAnnouncer_->addSession(id, managed.sdp);
+        }
+    }
+    AES67_LOGF("StreamManager: announcing %zu TX stream(s) over SAP", txCount);
+}
+
+void StreamManager::stopAnnouncingTxStreams() {
+    if (sapAnnouncer_ && sapAnnouncer_->isRunning()) {
+        sapAnnouncer_->stop();  // sends deletions for everything it advertised
     }
 }
 

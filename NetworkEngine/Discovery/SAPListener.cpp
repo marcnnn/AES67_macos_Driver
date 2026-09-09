@@ -209,6 +209,27 @@ private:
             return announcement;
         }
 
+        // RFC 2974 allows an optional payload type before the payload proper:
+        // a MIME type terminated by NUL, which a sender may omit only when the
+        // payload already begins with "v=0". Real AES67 senders do include it,
+        // so skip it -- otherwise "application/sdp\0" stays glued to the front
+        // of the description and every field parsed from it is wrong.
+        if (payloadLen >= 3 && std::strncmp(data + payloadStart, "v=0", 3) != 0) {
+            const void* nul = std::memchr(data + payloadStart, '\0', payloadLen);
+            if (nul != nullptr) {
+                size_t typeLen =
+                    static_cast<size_t>(static_cast<const char*>(nul) - (data + payloadStart)) + 1;
+                payloadStart += typeLen;
+                if (payloadStart >= length) {
+                    return announcement; // Payload type with nothing after it
+                }
+                payloadLen = length - payloadStart;
+                if (payloadLen < 5) {
+                    return announcement;
+                }
+            }
+        }
+
         // The payload should be an SDP description
         std::string sdpContent(data + payloadStart, payloadLen);
 

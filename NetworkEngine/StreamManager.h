@@ -11,6 +11,7 @@
 #include "RTP/RTPReceiver.h"
 #include "RTP/RTPTransmitter.h"
 #include "PTP/PTPClock.h"
+#include "Discovery/SAPAnnouncer.h"
 #include <map>
 #include <memory>
 #include <mutex>
@@ -61,12 +62,17 @@ public:
     //
 
     /// Create a TX stream that reads from device output channels and sends RTP.
+    /// @param networkInterface Interface name ("en0") or IP to transmit from.
+    ///                         Empty lets the routing table choose, which on a
+    ///                         multi-homed host usually sends the audio out
+    ///                         the wrong network.
     StreamID createTxStream(
         const std::string& name,
         const std::string& multicastIP,
         uint16_t port,
         uint16_t numChannels,
-        const ChannelMapping& mapping
+        const ChannelMapping& mapping,
+        const std::string& networkInterface = ""
     );
 
     // Export stream to SDP file
@@ -172,6 +178,7 @@ private:
         std::unique_ptr<RTPTransmitter> transmitter;
         StreamInfo info;
         bool isTransmit{false};
+        std::string networkInterface;
     };
 
     // Validation helpers
@@ -208,6 +215,14 @@ private:
     StreamChannelMapper mapper_;
     std::map<StreamID, ManagedStream> streams_;
     mutable std::mutex streamsMutex_;
+
+    /// Advertise every transmit stream over SAP while IO is running. Without
+    /// this a transmit stream is invisible to other AES67 devices: they
+    /// subscribe from the announcement, not from the RTP itself.
+    void startAnnouncingTxStreams();
+    void stopAnnouncingTxStreams();
+
+    std::unique_ptr<SAPAnnouncer> sapAnnouncer_;
 
     // Configuration management
     std::unique_ptr<StreamConfigManager> configManager_;

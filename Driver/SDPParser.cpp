@@ -488,9 +488,14 @@ std::vector<std::string> SDPParser::generateAttributes(const SDPSession& session
     // PTP reference clock
     if (session.ptpDomain >= 0 && !session.ptpMasterMAC.empty()) {
         std::ostringstream ptpRefclk;
+        // Write the domain as a bare number. Both spellings parse (see
+        // parsePTPRefClockAttribute), but this is the one AES67 hardware
+        // emits -- Dante devices and the other AES67 senders observed on the
+        // wire all use it -- so it is the safer form to be judged on by a
+        // receiver deciding whether to subscribe.
         ptpRefclk << "a=ts-refclk:ptp=IEEE1588-2008:"
                   << session.ptpMasterMAC
-                  << ":domain-nmbr=" << session.ptpDomain;
+                  << ":" << session.ptpDomain;
         attributes.push_back(ptpRefclk.str());
     }
 
