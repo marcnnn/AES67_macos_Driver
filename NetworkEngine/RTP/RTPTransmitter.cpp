@@ -111,8 +111,13 @@ bool RTPTransmitter::start() {
                        sdp_.sessionName.c_str());
         }
 
-        timestamp_ = computeInitialTimestamp();
-        startTime_ = std::chrono::steady_clock::now();
+        mediaTicks_ = computeInitialMediaTicks();
+        timestamp_ = static_cast<uint32_t>(mediaTicks_ & 0xFFFFFFFFULL);
+
+        // Fallback schedule, used only when there is no media clock to pace
+        // against. Started in the past by sendAhead_ so packets still leave
+        // early; see setSendAhead().
+        startTime_ = std::chrono::steady_clock::now() - sendAhead_;
 
         transmitLoop();
     });
@@ -181,10 +186,36 @@ void RTPTransmitter::transmitLoop() {
     auto nextTransmitTime = startTime_;
     bool unsupportedEncodingLogged = false;
 
+    const uint64_t sendAheadNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(sendAhead_).count());
+
     while (running_) {
-        // Wait until next transmit time (precise 1ms intervals)
-        std::this_thread::sleep_until(nextTransmitTime);
-        nextTransmitTime += packetInterval_;
+        // Pace against the media clock rather than the local one.
+        //
+        // The receiver judges every packet against the grandmaster's clock,
+        // and the local clock runs at a measurably different rate -- tens of
+        // ppm here. Advancing a local-clock schedule by a fixed interval per
+        // packet therefore walks steadily away from the media clock, and a
+        // stream that starts comfortably inside the receiver's window drifts
+        // out of it. Deriving each packet's send instant from the media clock
+        // directly leaves nothing to accumulate.
+        if (mediaClockSource_) {
+            const uint64_t targetNs = mediaTicksToNs(mediaTicks_);
+            const uint64_t nowNs = mediaClockSource_();
+
+            if (nowNs != 0 && targetNs > nowNs + sendAheadNs) {
+                const uint64_t waitNs = targetNs - nowNs - sendAheadNs;
+                // A wait longer than a moment means the clock jumped; fall
+                // through and send rather than stalling the stream.
+                if (waitNs < 100000000ULL) {
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(waitNs));
+                }
+            }
+        } else {
+            // No media clock: keep the fixed local schedule.
+            std::this_thread::sleep_until(nextTransmitTime);
+            nextTransmitTime += packetInterval_;
+        }
 
         // Read audio from device channels (silence-fills on underrun)
         // Always send packets even with empty ring buffers — AES67 requires
@@ -213,8 +244,10 @@ void RTPTransmitter::transmitLoop() {
         // Send RTP packet
         sendPacket(payload, payloadSize, timestamp_);
 
-        // Update timestamp (increment by samples per packet)
-        timestamp_ += samplesPerPacket;
+        // Advance the media clock position; the RTP timestamp is its low
+        // 32 bits and wraps naturally.
+        mediaTicks_ += samplesPerPacket;
+        timestamp_ = static_cast<uint32_t>(mediaTicks_ & 0xFFFFFFFFULL);
 
         // Update statistics
         stats_.bytesSent.fetch_add(payloadSize, std::memory_order_relaxed);
@@ -293,7 +326,15 @@ void RTPTransmitter::encodeL24(const float* audio, size_t frameCount, uint8_t* p
     }
 }
 
-uint32_t RTPTransmitter::computeInitialTimestamp() const {
+uint64_t RTPTransmitter::mediaTicksToNs(uint64_t ticks) const {
+    const uint64_t rate = sdp_.sampleRate ? sdp_.sampleRate : 48000;
+    // Split so the multiply cannot overflow on a long-running stream.
+    const uint64_t seconds = ticks / rate;
+    const uint64_t remainder = ticks % rate;
+    return seconds * 1000000000ULL + (remainder * 1000000000ULL) / rate;
+}
+
+uint64_t RTPTransmitter::computeInitialMediaTicks() const {
     if (!mediaClockSource_) {
         // Nothing to anchor to. The stream will still decode, but a receiver
         // has no way to align it and will treat it as carrying no data.
@@ -319,10 +360,10 @@ uint32_t RTPTransmitter::computeInitialTimestamp() const {
     const uint64_t ticks   = seconds * sampleRate +
                              (nanos * sampleRate) / 1000000000ULL;
 
-    const uint32_t anchored = static_cast<uint32_t>(ticks & 0xFFFFFFFFULL);
     AES67_LOGF("RTPTransmitter: anchored RTP timestamp for '%s' to media clock (%u)",
-               sdp_.sessionName.c_str(), anchored);
-    return anchored;
+               sdp_.sessionName.c_str(),
+               static_cast<uint32_t>(ticks & 0xFFFFFFFFULL));
+    return ticks;
 }
 
 void RTPTransmitter::sendPacket(const uint8_t* payload, size_t payloadSize, uint32_t timestamp) {

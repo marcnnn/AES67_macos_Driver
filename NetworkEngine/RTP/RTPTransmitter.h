@@ -80,9 +80,31 @@ public:
         mediaClockSource_ = std::move(source);
     }
 
+    /// Emit each packet this far ahead of the media time its RTP timestamp
+    /// carries.
+    ///
+    /// A receiver plays a packet at its timestamp plus a fixed link offset,
+    /// and discards anything arriving after that. The offset can be small and
+    ///, on some receivers, not adjustable -- Dante fixes it at 2ms for AES67 --
+    /// so whatever the sender and the receiver's own pipeline consume between
+    /// them has to fit inside it. Emitting early buys that headroom back.
+    ///
+    /// The cost is buffering: sending ahead drains the output ring buffer
+    /// sooner, so the producer has correspondingly less slack. Timestamps are
+    /// unaffected -- they still name the sampling instant -- so the audio
+    /// stays correctly placed in time, it simply leaves sooner.
+    ///
+    /// Must be set before start().
+    void setSendAhead(std::chrono::microseconds ahead) { sendAhead_ = ahead; }
+    std::chrono::microseconds getSendAhead() const { return sendAhead_; }
+
 private:
-    /// Anchor the RTP timestamp to the media clock, or 0 with no clock source.
-    uint32_t computeInitialTimestamp() const;
+    /// Anchor the media clock counter, or 0 with no clock source. Kept as a
+    /// full 64-bit tick count; the RTP timestamp is its low 32 bits.
+    uint64_t computeInitialMediaTicks() const;
+
+    /// Convert a media tick count to nanoseconds on the grandmaster timescale.
+    uint64_t mediaTicksToNs(uint64_t ticks) const;
 
     MediaClockSource mediaClockSource_;
 
@@ -123,6 +145,15 @@ private:
     // Timing
     std::chrono::steady_clock::time_point startTime_;
     std::chrono::microseconds packetInterval_;
+
+    // Default to one packet interval: enough to matter to a receiver with a
+    // tight link offset, small enough not to eat meaningfully into buffering.
+    std::chrono::microseconds sendAhead_{1000};
+
+    // Full-width media clock position of the next packet. timestamp_ is this
+    // truncated to 32 bits; this is kept separately so the send schedule can be
+    // derived from it without having to undo the wrap.
+    uint64_t mediaTicks_{0};
 
     // Audio buffer (reused to avoid allocations)
     std::vector<float> audioBuffer_;
