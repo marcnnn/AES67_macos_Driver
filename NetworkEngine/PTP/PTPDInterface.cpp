@@ -147,6 +147,13 @@ PTPDiagnostics& PTPDInterface::getDiagnostics() {
     return diagnostics_;
 }
 
+uint64_t PTPDInterface::getMasterTimeNs() const {
+    if (!ptpSlave_ || !ptpSlave_->isLocked()) {
+        return 0;
+    }
+    return ptpSlave_->getMasterTimeNs();
+}
+
 void PTPDInterface::onPTPMeasurement(int64_t offsetNs, int64_t pathDelayNs,
                                       double driftPpb, uint8_t clockClass,
                                       uint8_t clockAccuracy, bool locked,

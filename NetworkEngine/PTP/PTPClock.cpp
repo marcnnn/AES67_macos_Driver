@@ -131,6 +131,10 @@ void PTPClock::stop() {
     }
 }
 
+uint64_t PTPClock::getMasterTimeNs() const {
+    return ptpdInterface_ ? ptpdInterface_->getMasterTimeNs() : 0;
+}
+
 uint64_t PTPClock::getTime() const {
     // Get local time
     uint64_t localTime = localClock_->getTime();
@@ -535,6 +539,11 @@ uint64_t PTPClockManager::getTimeForStream(const SDPSession& sdp) {
     int domain = sdp.ptpDomain;
 
     return getTimeForDomain(domain);
+}
+
+uint64_t PTPClockManager::getMasterTimeForStream(const SDPSession& sdp) {
+    auto clock = getClockForDomain(sdp.ptpDomain);
+    return clock ? clock->getMasterTimeNs() : 0;
 }
 
 uint64_t PTPClockManager::getTimeForDomain(int domain) {

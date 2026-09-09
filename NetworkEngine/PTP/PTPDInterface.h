@@ -44,6 +44,13 @@ public:
     // NOT be synchronized to network PTP time.
     bool isStubMode() const { return stubMode_; }
 
+    /// Current time on the grandmaster's timescale, in nanoseconds, or 0 if
+    /// there is no locked slave. This is not the system clock: a grandmaster
+    /// may run from an entirely different epoch (Dante hardware typically runs
+    /// from its own uptime), which is exactly why RTP timestamps have to come
+    /// from here rather than from the local clock.
+    uint64_t getMasterTimeNs() const;
+
     // Set PTP domain (default 0, per AES67)
     void setDomain(int domain) { domain_ = domain; }
     int getDomain() const { return domain_; }

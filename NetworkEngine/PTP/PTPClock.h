@@ -102,6 +102,12 @@ public:
      * @param ptpArrivalTimeNs The PTP time when packet arrived (nanoseconds)
      * @param sampleRate The sample rate of the stream
      */
+    /// Current time on the grandmaster's timescale, in nanoseconds, or 0 when
+    /// no PTP lock exists. Use this, not getTime(), to derive RTP timestamps:
+    /// getTime() returns local time adjusted by the residual offset, which is
+    /// the local epoch, whereas RTP timestamps must be on the master's.
+    uint64_t getMasterTimeNs() const;
+
     void recordMediaClockReference(uint32_t rtpTimestamp, uint64_t ptpArrivalTimeNs, uint32_t sampleRate);
 
     /**
@@ -258,6 +264,11 @@ public:
 
     // Get time for specific domain (or fallback if not available)
     uint64_t getTimeForDomain(int domain);
+
+    /// Grandmaster timescale time for a stream's PTP domain, in nanoseconds,
+    /// or 0 if that domain has no lock. This is the clock RTP timestamps must
+    /// be derived from.
+    uint64_t getMasterTimeForStream(const SDPSession& sdp);
 
     // Get fallback local time
     uint64_t getLocalTime() const;

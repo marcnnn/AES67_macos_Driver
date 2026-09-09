@@ -686,7 +686,21 @@ std::unique_ptr<RTPTransmitter> StreamManager::createTransmitter(
     const std::string& networkInterface
 ) {
     // Transmitters read audio from OUTPUT buffers (Core Audio → Network)
-    return std::make_unique<RTPTransmitter>(sdp, mapping, outputChannels_, networkInterface);
+    auto transmitter = std::make_unique<RTPTransmitter>(
+        sdp, mapping, outputChannels_, networkInterface);
+
+    // Derive RTP timestamps from the grandmaster's clock. A receiver uses them
+    // to place our samples on its own playout timeline, so without this the
+    // stream decodes but is reported as carrying no data.
+    if (ptpManager_) {
+        auto manager = ptpManager_;
+        SDPSession sdpCopy = sdp;
+        transmitter->setMediaClockSource([manager, sdpCopy]() -> uint64_t {
+            return manager->getMasterTimeForStream(sdpCopy);
+        });
+    }
+
+    return transmitter;
 }
 
 //

@@ -84,7 +84,7 @@ bool RTPTransmitter::start() {
     }
 
     // Initialize timestamp and sequence number
-    timestamp_ = 0;
+    timestamp_ = computeInitialTimestamp();
     sequenceNumber_ = 0;
 
     // Record start time for precise packet timing
@@ -274,6 +274,38 @@ void RTPTransmitter::encodeL24(const float* audio, size_t frameCount, uint8_t* p
         payload[i * 3 + 1] = (pcmSample >> 8) & 0xFF;
         payload[i * 3 + 2] = pcmSample & 0xFF;
     }
+}
+
+uint32_t RTPTransmitter::computeInitialTimestamp() const {
+    if (!mediaClockSource_) {
+        // Nothing to anchor to. The stream will still decode, but a receiver
+        // has no way to align it and will treat it as carrying no data.
+        AES67_LOGF("RTPTransmitter: no media clock source for '%s'; RTP timestamps "
+                   "will not be PTP-aligned and receivers may reject the stream",
+                   sdp_.sessionName.c_str());
+        return 0;
+    }
+
+    const uint64_t ptpNs = mediaClockSource_();
+    if (ptpNs == 0) {
+        AES67_LOGF("RTPTransmitter: media clock unavailable for '%s'; starting "
+                   "timestamps at 0", sdp_.sessionName.c_str());
+        return 0;
+    }
+
+    // timestamp = media clock time in sample periods, wrapped to 32 bits.
+    // Split the conversion so neither term overflows: seconds * rate stays
+    // exact, and the sub-second part is scaled before it can lose precision.
+    const uint64_t sampleRate = sdp_.sampleRate;
+    const uint64_t seconds = ptpNs / 1000000000ULL;
+    const uint64_t nanos   = ptpNs % 1000000000ULL;
+    const uint64_t ticks   = seconds * sampleRate +
+                             (nanos * sampleRate) / 1000000000ULL;
+
+    const uint32_t anchored = static_cast<uint32_t>(ticks & 0xFFFFFFFFULL);
+    AES67_LOGF("RTPTransmitter: anchored RTP timestamp for '%s' to media clock (%u)",
+               sdp_.sessionName.c_str(), anchored);
+    return anchored;
 }
 
 void RTPTransmitter::sendPacket(const uint8_t* payload, size_t payloadSize, uint32_t timestamp) {

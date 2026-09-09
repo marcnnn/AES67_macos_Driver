@@ -9,6 +9,7 @@
 #include "../StreamChannelMapper.h"
 #include "SimpleRTP.h"
 #include "../../Driver/AudioThreadPriority.h"
+#include <functional>
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -63,7 +64,28 @@ public:
     const SDPSession& getSDPSession() const { return sdp_; }
     const ChannelMapping& getMapping() const { return mapping_; }
 
+    /// Returns the current media clock time in nanoseconds, on the timescale
+    /// of the PTP grandmaster named in the stream's SDP.
+    using MediaClockSource = std::function<uint64_t()>;
+
+    /// Supply the clock the RTP timestamps are derived from. AES67 requires the
+    /// timestamp of each packet to be the media clock instant of its first
+    /// sample, taken from the PTP grandmaster -- that is how a receiver places
+    /// our samples on its own playout timeline. A stream whose timestamps merely
+    /// count up from zero is decodable but unusable: receivers report it as
+    /// carrying no data, because they cannot locate it in time.
+    ///
+    /// Must be set before start(); the timestamp is anchored there.
+    void setMediaClockSource(MediaClockSource source) {
+        mediaClockSource_ = std::move(source);
+    }
+
 private:
+    /// Anchor the RTP timestamp to the media clock, or 0 with no clock source.
+    uint32_t computeInitialTimestamp() const;
+
+    MediaClockSource mediaClockSource_;
+
     // Transmit thread function
     void transmitLoop();
 
