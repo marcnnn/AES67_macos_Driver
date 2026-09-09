@@ -406,8 +406,30 @@ bool testFullLoopback() {
     bool txStarted = transmitter.start();
     TEST_ASSERT(txStarted, "Loopback transmitter should start");
 
-    // Let the loopback run for enough time for packets to flow
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Drain the receiver continuously while the loopback runs.
+    //
+    // Only prefillFrames of real audio were ever queued, and the transmitter
+    // emits silence once its ring buffer runs dry -- which happens well before
+    // the run ends. The receive ring buffer holds kRingBufferSize frames, so
+    // sleeping and reading once at the end would find nothing but that
+    // trailing silence, every sample of interest having been overwritten.
+    std::vector<float> rxCh0Data;
+    std::vector<float> rxCh1Data;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(200);
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (size_t ch = 0; ch < 2; ++ch) {
+            const size_t avail = rxBuffers[ch].available();
+            if (avail == 0) {
+                continue;
+            }
+            std::vector<float> chunk(avail);
+            rxBuffers[ch].read(chunk.data(), avail);
+            std::vector<float>& dest = (ch == 0) ? rxCh0Data : rxCh1Data;
+            dest.insert(dest.end(), chunk.begin(), chunk.end());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 
     // Stop both
     transmitter.stop();
@@ -421,37 +443,38 @@ bool testFullLoopback() {
     StatisticsSnapshot rxStats = receiver.getStatistics();
     TEST_ASSERT(rxStats.packetsReceived > 0, "RX should have received packets");
 
-    // Verify data arrived in RX ring buffers
-    size_t rxCh0Available = rxBuffers[0].available();
-    size_t rxCh1Available = rxBuffers[1].available();
-    TEST_ASSERT(rxCh0Available > 0, "RX channel 0 should have data");
-    TEST_ASSERT(rxCh1Available > 0, "RX channel 1 should have data");
+    TEST_ASSERT(!rxCh0Data.empty(), "RX channel 0 should have data");
+    TEST_ASSERT(!rxCh1Data.empty(), "RX channel 1 should have data");
 
-    // Read received data and verify integrity
-    std::vector<float> rxCh0Data(rxCh0Available);
-    std::vector<float> rxCh1Data(rxCh1Available);
-    rxBuffers[0].read(rxCh0Data.data(), rxCh0Available);
-    rxBuffers[1].read(rxCh1Data.data(), rxCh1Available);
-
-    // Check that received values match sent values within L24 precision
+    // Every sample must be either the value that was queued or the silence the
+    // transmitter substitutes once it runs dry. Anything else means the
+    // encode/network/decode round trip corrupted it.
     // L24 round-trip tolerance: ~0.001
-    bool ch0Correct = true;
-    for (size_t i = 0; i < rxCh0Available; ++i) {
-        if (std::abs(rxCh0Data[i] - 0.25f) > 0.01f) {
-            ch0Correct = false;
-            break;
-        }
-    }
-    TEST_ASSERT(ch0Correct, "Loopback channel 0 data should match (~0.25f)");
+    auto countMatchesRejectingGarbage =
+        [](const std::vector<float>& data, float expected, size_t& matched) {
+            matched = 0;
+            for (float sample : data) {
+                if (std::abs(sample - expected) <= 0.01f) {
+                    matched++;
+                } else if (std::abs(sample) > 0.01f) {
+                    return false;  // neither the queued value nor silence
+                }
+            }
+            return true;
+        };
 
-    bool ch1Correct = true;
-    for (size_t i = 0; i < rxCh1Available; ++i) {
-        if (std::abs(rxCh1Data[i] - (-0.75f)) > 0.01f) {
-            ch1Correct = false;
-            break;
-        }
-    }
-    TEST_ASSERT(ch1Correct, "Loopback channel 1 data should match (~-0.75f)");
+    size_t ch0Matched = 0;
+    size_t ch1Matched = 0;
+    TEST_ASSERT(countMatchesRejectingGarbage(rxCh0Data, 0.25f, ch0Matched),
+                "Loopback channel 0 should contain only 0.25f or silence");
+    TEST_ASSERT(countMatchesRejectingGarbage(rxCh1Data, -0.75f, ch1Matched),
+                "Loopback channel 1 should contain only -0.75f or silence");
+
+    // ...and every frame that was queued should have survived the round trip.
+    TEST_ASSERT(ch0Matched == prefillFrames,
+                "Loopback channel 0 should recover every prefilled frame");
+    TEST_ASSERT(ch1Matched == prefillFrames,
+                "Loopback channel 1 should recover every prefilled frame");
 
     std::cout << "PASS" << std::endl;
     return true;
