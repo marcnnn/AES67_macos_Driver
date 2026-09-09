@@ -15,6 +15,7 @@
 
 #include "PTPSlave.h"
 #include "PTPDiagnostics.h"
+#include "../../Driver/DebugLog.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -155,6 +156,7 @@ bool PTPSlave::start() {
 
     // Create multicast sockets
     if (!createSockets()) {
+        AES67_LOG("PTPSlave: could not create PTP sockets; PTP will not run");
         std::cerr << "[PTPSlave] Failed to create PTP sockets on "
                   << config_.interfaceName << std::endl;
         return false;
@@ -273,6 +275,8 @@ bool PTPSlave::createSockets() {
     // --- Event socket (port 319) ---
     eventSocket_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (eventSocket_ < 0) {
+        AES67_LOGF("PTPSlave: failed to create event socket (errno=%d: %s)",
+                   errno, strerror(errno));
         std::cerr << "[PTPSlave] Failed to create event socket: "
                   << strerror(errno) << std::endl;
         return false;
@@ -301,6 +305,8 @@ bool PTPSlave::createSockets() {
     addr.sin_port = htons(kPTPEventPort);
 
     if (bind(eventSocket_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        AES67_LOGF("PTPSlave: failed to bind event socket to port %u (errno=%d: %s)",
+                   kPTPEventPort, errno, strerror(errno));
         std::cerr << "[PTPSlave] Failed to bind event socket to port "
                   << kPTPEventPort << ": " << strerror(errno) << std::endl;
         closeSockets();
@@ -327,6 +333,8 @@ bool PTPSlave::createSockets() {
     }
 
     if (setsockopt(eventSocket_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        AES67_LOGF("PTPSlave: failed to join multicast %s (errno=%d: %s)",
+                   kPTPPrimaryMulticast, errno, strerror(errno));
         std::cerr << "[PTPSlave] Failed to join multicast " << kPTPPrimaryMulticast
                   << " on event socket: " << strerror(errno) << std::endl;
         closeSockets();
@@ -348,6 +356,8 @@ bool PTPSlave::createSockets() {
     // --- General socket (port 320) ---
     generalSocket_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (generalSocket_ < 0) {
+        AES67_LOGF("PTPSlave: failed to create general socket (errno=%d: %s)",
+                   errno, strerror(errno));
         std::cerr << "[PTPSlave] Failed to create general socket: "
                   << strerror(errno) << std::endl;
         closeSockets();
@@ -368,6 +378,8 @@ bool PTPSlave::createSockets() {
     gaddr.sin_port = htons(kPTPGeneralPort);
 
     if (bind(generalSocket_, reinterpret_cast<struct sockaddr*>(&gaddr), sizeof(gaddr)) < 0) {
+        AES67_LOGF("PTPSlave: failed to bind general socket to port %u (errno=%d: %s)",
+                   kPTPGeneralPort, errno, strerror(errno));
         std::cerr << "[PTPSlave] Failed to bind general socket to port "
                   << kPTPGeneralPort << ": " << strerror(errno) << std::endl;
         closeSockets();
@@ -376,6 +388,8 @@ bool PTPSlave::createSockets() {
 
     // Join multicast on general socket too
     if (setsockopt(generalSocket_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        AES67_LOGF("PTPSlave: failed to join multicast %s (errno=%d: %s)",
+                   kPTPPrimaryMulticast, errno, strerror(errno));
         std::cerr << "[PTPSlave] Failed to join multicast " << kPTPPrimaryMulticast
                   << " on general socket: " << strerror(errno) << std::endl;
         closeSockets();
