@@ -907,6 +907,163 @@ void PTPSlave::resetEpochBaseline() {
     offsetHistoryIndex_ = 0;
     lastDriftCalcTimeNs_ = 0;
     lastDriftCalcOffsetNs_ = 0;
+    resetServo();
+}
+
+void PTPSlave::resetServo() {
+    servoFreqPpb_.store(0.0, std::memory_order_release);
+    servoCorrectionNs_.store(0, std::memory_order_release);
+    servoLastUpdateMonoNs_.store(0, std::memory_order_release);
+    servoFreqSeeded_.store(false, std::memory_order_release);
+    servoStarted_ = false;
+    servoHistoryIndex_ = 0;
+    servoHistoryCount_ = 0;
+    servoHistoryOriginNs_ = 0;
+}
+
+// Least-squares slope through the recent (time, offset) samples.
+//
+// The offset between the two clocks is a straight line with slope equal to
+// their frequency difference, buried in per-measurement jitter. Fitting the
+// line over many samples recovers the slope far more accurately than
+// differencing any two points: the jitter averages down, the ramp does not.
+bool PTPSlave::estimateFrequencyPpb(double& ppbOut) const {
+    const size_t n = servoHistoryCount_;
+    if (n < config_.servoMinFrequencySamples || n < 2) {
+        return false;
+    }
+
+    double sumT = 0.0, sumY = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        sumT += servoHistoryTimeS_[i];
+        sumY += servoHistoryOffsetNs_[i];
+    }
+    const double meanT = sumT / static_cast<double>(n);
+    const double meanY = sumY / static_cast<double>(n);
+
+    double covTY = 0.0, varT = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double dT = servoHistoryTimeS_[i] - meanT;
+        covTY += dT * (servoHistoryOffsetNs_[i] - meanY);
+        varT  += dT * dT;
+    }
+    if (varT <= 0.0) return false;
+
+    // Slope is ns per second, which is ppb directly.
+    ppbOut = covTY / varT;
+    return true;
+}
+
+// Feed one measurement to the virtual clock servo and return the residual.
+//
+// The servo maintains a correction that tracks `measuredNs` -- the offset
+// between the local clock and the master. Because the two crystals run at
+// slightly different rates, `measuredNs` is a ramp; the correction follows it,
+// and what is left over (the residual) is the part the servo has not accounted
+// for. That residual is what callers should see as "offset from master": it
+// stays near zero while tracking holds, instead of growing forever.
+//
+// Only ever called from the receive thread.
+int64_t PTPSlave::updateServo(int64_t measuredNs) {
+    const uint64_t nowMono = getMonotonicTimeNs();
+
+    if (!servoStarted_) {
+        // Nothing to difference against yet. Adopt the measurement as the
+        // starting correction so the first residual is zero rather than the
+        // whole epoch-normalised offset.
+        servoStarted_ = true;
+        servoHistoryOriginNs_ = nowMono;
+        servoCorrectionNs_.store(measuredNs, std::memory_order_release);
+        servoLastUpdateMonoNs_.store(nowMono, std::memory_order_release);
+    }
+
+    // Record the sample for the frequency fit.
+    const size_t capacity = std::min(config_.servoFrequencyWindow, kServoHistoryCapacity);
+    servoHistoryTimeS_[servoHistoryIndex_] =
+        static_cast<double>(nowMono - servoHistoryOriginNs_) / 1e9;
+    servoHistoryOffsetNs_[servoHistoryIndex_] = static_cast<double>(measuredNs);
+    servoHistoryIndex_ = (servoHistoryIndex_ + 1) % capacity;
+    if (servoHistoryCount_ < capacity) servoHistoryCount_++;
+
+    const uint64_t lastMono = servoLastUpdateMonoNs_.load(std::memory_order_acquire);
+    const double dt = static_cast<double>(nowMono - lastMono) / 1e9;
+    if (dt < 0.0) {
+        // Out-of-order measurement; nothing useful to do.
+        return measuredNs - servoCorrectionNs_.load(std::memory_order_acquire);
+    }
+
+    double freqPpb = servoFreqPpb_.load(std::memory_order_acquire);
+    int64_t correction = servoCorrectionNs_.load(std::memory_order_acquire);
+
+    // Refresh the frequency estimate from the fit. This replaces the estimate
+    // outright rather than nudging it, because the fit already averages over
+    // the whole window -- there is no accumulated state to preserve and so no
+    // way for it to wind up.
+    double fittedPpb = 0.0;
+    if (estimateFrequencyPpb(fittedPpb)) {
+        freqPpb = std::clamp(fittedPpb,
+                             -config_.servoMaxFrequencyPpb,
+                             config_.servoMaxFrequencyPpb);
+        if (!servoFreqSeeded_.exchange(true, std::memory_order_acq_rel)) {
+            std::cout << "[PTPSlave] Servo frequency acquired: " << freqPpb
+                      << " ppb over " << servoHistoryCount_ << " samples (local clock runs "
+                      << (freqPpb >= 0.0 ? "fast" : "slow")
+                      << " relative to master)" << std::endl;
+        }
+    }
+
+    // Advance the correction at the rate the clocks differ by. 1 ppb is 1 ns
+    // per second, so ppb * seconds gives ns directly.
+    correction += static_cast<int64_t>(freqPpb * dt);
+
+    int64_t residual = measuredNs - correction;
+
+    if (residual > config_.servoStepThresholdNs ||
+        residual < -config_.servoStepThresholdNs) {
+        // Too far out to slew. Step the correction onto the measurement and
+        // start the frequency estimate over.
+        std::cout << "[PTPSlave] Servo step: residual " << residual
+                  << "ns exceeds threshold - re-acquiring" << std::endl;
+        correction = measuredNs;
+        residual = 0;
+        freqPpb = 0.0;
+        servoFreqSeeded_.store(false, std::memory_order_release);
+        servoHistoryIndex_ = 0;
+        servoHistoryCount_ = 0;
+        servoHistoryOriginNs_ = nowMono;
+        locked_.store(false, std::memory_order_release);
+        consecutiveGoodMeasurements_ = 0;
+    } else {
+        // Phase term: pull the correction towards the measurement. The
+        // frequency term above handles the ramp, so this only has to absorb
+        // what is left, and can stay gentle enough not to inject jitter into
+        // the virtual clock.
+        correction += static_cast<int64_t>(config_.servoProportional *
+                                           static_cast<double>(residual));
+    }
+
+    servoFreqPpb_.store(freqPpb, std::memory_order_release);
+    servoCorrectionNs_.store(correction, std::memory_order_release);
+    servoLastUpdateMonoNs_.store(nowMono, std::memory_order_release);
+
+    return residual;
+}
+
+uint64_t PTPSlave::getMasterTimeNs() const {
+    // master time = local time - epoch difference - servo correction, with the
+    // correction projected forward from the last update at the current rate.
+    const int64_t local = static_cast<int64_t>(getSystemTimeNs());
+    const int64_t epoch = epochBaselineNs_.load(std::memory_order_acquire);
+    int64_t correction = servoCorrectionNs_.load(std::memory_order_acquire);
+
+    const uint64_t lastMono = servoLastUpdateMonoNs_.load(std::memory_order_acquire);
+    if (lastMono != 0) {
+        const double dt = static_cast<double>(getMonotonicTimeNs() - lastMono) / 1e9;
+        correction += static_cast<int64_t>(
+            servoFreqPpb_.load(std::memory_order_acquire) * dt);
+    }
+
+    return static_cast<uint64_t>(local - epoch - correction);
 }
 
 void PTPSlave::calculateOffsetAndDelay() {
@@ -1054,35 +1211,47 @@ void PTPSlave::calculateOffsetAndDelay() {
     int64_t filteredOffset =
         offsetRef + offsetAcc / static_cast<int64_t>(offsetHistoryCount_);
 
-    // Store computed offset
-    offsetNs_.store(filteredOffset, std::memory_order_release);
+    // Run the servo on the filtered measurement. What callers see as the
+    // offset is the residual the servo has not yet corrected for; with the
+    // servo disabled it is the measurement itself, unchanged.
+    const int64_t reportedOffset =
+        config_.enableServo ? updateServo(filteredOffset) : filteredOffset;
 
-    // Drift estimation. Measure the interval on the monotonic clock:
-    // CLOCK_REALTIME can be stepped by NTP mid-measurement, which would show up
-    // as a huge spurious drift.
-    uint64_t nowNs = getMonotonicTimeNs();
-    if (lastDriftCalcTimeNs_ != 0) {
-        uint64_t dtNs = nowNs - lastDriftCalcTimeNs_;
-        if (dtNs > 500000000ULL) { // Update drift every 500ms minimum
-            int64_t dOffset = filteredOffset - lastDriftCalcOffsetNs_;
-            // drift in ppb = (dOffset_ns / dt_ns) * 1e9
-            double driftPpb = (static_cast<double>(dOffset) / static_cast<double>(dtNs)) * 1e9;
+    offsetNs_.store(reportedOffset, std::memory_order_release);
 
-            // Smooth drift
-            double prevDrift = frequencyDriftPpb_.load(std::memory_order_acquire);
-            double smoothed = prevDrift * 0.9 + driftPpb * 0.1;
-            frequencyDriftPpb_.store(smoothed, std::memory_order_release);
+    // Drift estimation. With the servo running, its frequency estimate is
+    // already exactly this quantity and is far steadier than differencing two
+    // jittery samples, so just publish that.
+    if (config_.enableServo) {
+        frequencyDriftPpb_.store(servoFreqPpb_.load(std::memory_order_acquire),
+                                 std::memory_order_release);
+    } else {
+        // Measure the interval on the monotonic clock: CLOCK_REALTIME can be
+        // stepped by NTP mid-measurement, which would show up as huge drift.
+        uint64_t nowNs = getMonotonicTimeNs();
+        if (lastDriftCalcTimeNs_ != 0) {
+            uint64_t dtNs = nowNs - lastDriftCalcTimeNs_;
+            if (dtNs > 500000000ULL) { // Update drift every 500ms minimum
+                int64_t dOffset = filteredOffset - lastDriftCalcOffsetNs_;
+                // drift in ppb = (dOffset_ns / dt_ns) * 1e9
+                double driftPpb = (static_cast<double>(dOffset) / static_cast<double>(dtNs)) * 1e9;
 
+                // Smooth drift
+                double prevDrift = frequencyDriftPpb_.load(std::memory_order_acquire);
+                double smoothed = prevDrift * 0.9 + driftPpb * 0.1;
+                frequencyDriftPpb_.store(smoothed, std::memory_order_release);
+
+                lastDriftCalcTimeNs_ = nowNs;
+                lastDriftCalcOffsetNs_ = filteredOffset;
+            }
+        } else {
             lastDriftCalcTimeNs_ = nowNs;
             lastDriftCalcOffsetNs_ = filteredOffset;
         }
-    } else {
-        lastDriftCalcTimeNs_ = nowNs;
-        lastDriftCalcOffsetNs_ = filteredOffset;
     }
 
     // Lock detection
-    if (std::abs(filteredOffset) < kLockToleranceNs) {
+    if (std::abs(reportedOffset) < kLockToleranceNs) {
         if (consecutiveGoodMeasurements_ < kLockThreshold * 2) {
             consecutiveGoodMeasurements_++;
         }
@@ -1097,11 +1266,11 @@ void PTPSlave::calculateOffsetAndDelay() {
         locked_.store(nowLocked, std::memory_order_release);
         if (nowLocked) {
             std::cout << "[PTPSlave] LOCKED to master — offset="
-                      << filteredOffset << "ns delay="
+                      << reportedOffset << "ns delay="
                       << pathDelayNs_.load(std::memory_order_acquire) << "ns" << std::endl;
         } else {
             std::cout << "[PTPSlave] Lock LOST — offset="
-                      << filteredOffset << "ns" << std::endl;
+                      << reportedOffset << "ns" << std::endl;
         }
     }
 
@@ -1110,7 +1279,7 @@ void PTPSlave::calculateOffsetAndDelay() {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         if (measurementCallback_) {
             PTPMeasurement m;
-            m.offsetFromMasterNs = filteredOffset;
+            m.offsetFromMasterNs = reportedOffset;
             m.meanPathDelayNs = pathDelayNs_.load(std::memory_order_acquire);
             m.frequencyDriftPpb = frequencyDriftPpb_.load(std::memory_order_acquire);
             {

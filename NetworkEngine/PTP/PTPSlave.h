@@ -181,6 +181,46 @@ struct PTPSlaveConfig {
     // implausible differences are normalised away. The same threshold detects
     // a master that steps its clock or restarts its epoch mid-session.
     int64_t epochThresholdNs = 1000000000LL;   // 1 s
+
+    // --- Clock servo ---
+    //
+    // The slave never steers the system clock: that would need root, would
+    // move time for the whole machine, and would fight timed/NTP. Instead it
+    // maintains a *virtual* clock -- an estimate of the master's time built
+    // from the local clock plus a correction this servo maintains.
+    //
+    // Without it, the reported offset is the raw divergence between two
+    // free-running crystals and grows without bound (~4ppm against a WING,
+    // so ~4us every second), and lock is guaranteed to be lost eventually.
+    // With it, the reported offset is the *residual after correction*, which
+    // stays near zero for as long as the servo can track.
+    bool enableServo = true;
+
+    // Phase gain: fraction of the residual folded into the correction each
+    // update. Higher converges faster and tracks noise more.
+    double servoProportional = 0.1;
+
+    // The frequency difference is estimated by least-squares fitting a slope
+    // through the recent offset measurements, rather than by integrating the
+    // residual. Software timestamping leaves tens of microseconds of jitter on
+    // each measurement while the divergence itself is only a few microseconds
+    // per second, so any estimator working from one or two samples measures
+    // mostly noise; a fit over many samples averages it down.
+    //
+    // At the usual 4 Sync/s, 256 samples is about a minute of history.
+    size_t servoFrequencyWindow = 256;
+
+    // Below this many samples the fit is still noise-dominated, so the servo
+    // runs on its phase term alone.
+    size_t servoMinFrequencySamples = 32;
+
+    // A residual beyond this means the master stepped or we lost tracking
+    // entirely. Re-acquire immediately rather than slewing there over minutes.
+    int64_t servoStepThresholdNs = 100000000LL;   // 100 ms
+
+    // No crystal is off by more than this, so a frequency estimate beyond it
+    // is a symptom of bad measurements rather than a real rate difference.
+    double servoMaxFrequencyPpb = 200000.0;       // 200 ppm
 };
 
 // ============================================================================
@@ -238,6 +278,28 @@ public:
     // The un-normalised offset, for diagnostics.
     int64_t getRawOffsetNs() const { return rawOffsetNs_.load(std::memory_order_acquire); }
 
+    // --- Clock servo (see PTPSlaveConfig::enableServo) ---
+
+    // How much faster the local clock runs than the master, in ppb. Unlike
+    // getFrequencyDriftPpb()'s raw derivative this converges to a stable
+    // value, because it is an estimate the servo maintains rather than a
+    // difference between two noisy samples.
+    double getServoFrequencyPpb() const { return servoFreqPpb_.load(std::memory_order_acquire); }
+
+    // The correction the virtual clock is currently applying, in ns. Grows
+    // steadily as the two crystals diverge -- that growth is exactly what is
+    // no longer showing up in getOffsetNs().
+    int64_t getServoCorrectionNs() const { return servoCorrectionNs_.load(std::memory_order_acquire); }
+
+    // True once the servo has measured the frequency difference directly,
+    // rather than still integrating its way towards it.
+    bool isServoFrequencySeeded() const { return servoFreqSeeded_.load(std::memory_order_acquire); }
+
+    // The virtual clock: our best estimate of the master's PTP time right
+    // now, in ns on the master's own epoch. This is the time base the media
+    // clock layer should use -- it advances at the master's rate, not ours.
+    uint64_t getMasterTimeNs() const;
+
     // Set callback for measurement updates
     void setMeasurementCallback(PTPMeasurementCallback cb);
 
@@ -277,6 +339,13 @@ private:
     // Discard the epoch baseline and the filter history that was accumulated
     // against it, so the next measurement re-establishes both.
     void resetEpochBaseline();
+
+    // Feed a measurement to the clock servo; returns the residual error after
+    // the correction the servo is applying.
+    int64_t updateServo(int64_t measuredOffsetNs);
+
+    // Drop the servo's frequency estimate and accumulated correction.
+    void resetServo();
 
     // Get current system time in nanoseconds
     static uint64_t getSystemTimeNs();
@@ -352,6 +421,27 @@ private:
     std::atomic<int64_t> rawOffsetNs_{0};
     std::atomic<int64_t> epochBaselineNs_{0};
     std::atomic<bool> epochBaselineValid_{false};
+
+    // Clock servo state. The atomics are published for readers on other
+    // threads; the plain members are only touched from the receive thread.
+    std::atomic<double> servoFreqPpb_{0.0};
+    std::atomic<int64_t> servoCorrectionNs_{0};
+    std::atomic<uint64_t> servoLastUpdateMonoNs_{0};
+    std::atomic<bool> servoFreqSeeded_{false};
+    bool servoStarted_{false};
+
+    // Rolling history the frequency fit runs over. Times are kept relative to
+    // servoHistoryOriginNs_ so the regression works on small numbers.
+    static constexpr size_t kServoHistoryCapacity = 256;
+    std::array<double, kServoHistoryCapacity> servoHistoryTimeS_{};
+    std::array<double, kServoHistoryCapacity> servoHistoryOffsetNs_{};
+    size_t servoHistoryIndex_{0};
+    size_t servoHistoryCount_{0};
+    uint64_t servoHistoryOriginNs_{0};
+
+    // Least-squares slope through the history, in ppb. Returns false while
+    // there are too few samples for the fit to mean anything.
+    bool estimateFrequencyPpb(double& ppbOut) const;
 
     // Offset filtering — simple moving average
     static constexpr size_t kOffsetFilterSize = 8;
