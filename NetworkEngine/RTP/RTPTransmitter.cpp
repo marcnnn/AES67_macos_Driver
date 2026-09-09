@@ -83,20 +83,29 @@ bool RTPTransmitter::start() {
         return false;
     }
 
-    // Initialize timestamp and sequence number
-    timestamp_ = computeInitialTimestamp();
     sequenceNumber_ = 0;
 
-    // Record start time for precise packet timing
-    startTime_ = std::chrono::steady_clock::now();
-
-    // Start transmit thread (elevated priority to prevent audio dropouts)
+    // Start transmit thread (elevated priority to prevent audio dropouts).
+    //
+    // Both the media clock anchor and the send schedule are taken inside the
+    // thread, immediately before the loop, rather than here. Spawning the
+    // thread and configuring its priority costs milliseconds -- enough that a
+    // schedule anchored on the calling thread is already in the past by the
+    // time the first packet goes out. Since the loop only ever advances the
+    // schedule by one packet interval, that startup lag never drains: every
+    // packet for the life of the stream leaves late by however long the thread
+    // took to get going, and receivers report the stream as late by exactly
+    // that amount.
     running_ = true;
     transmitThread_ = std::thread([this]() {
         if (!AudioThreadPriority::configureForRealTime()) {
             AES67_LOGF("RTPTransmitter: failed to set RT priority on transmit thread (stream=%s)",
                        sdp_.sessionName.c_str());
         }
+
+        timestamp_ = computeInitialTimestamp();
+        startTime_ = std::chrono::steady_clock::now();
+
         transmitLoop();
     });
 

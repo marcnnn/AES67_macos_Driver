@@ -520,7 +520,22 @@ void PTPSlave::receiveThread() {
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - currentMaster_.lastReceived).count();
-                int timeoutMs = config_.announceIntervalMs * config_.announceTimeoutMultiplier;
+
+                // Take the announce interval from the master rather than
+                // assuming one second. It advertises the interval as a power of
+                // two seconds in logMessageInterval, and a master announcing
+                // every two seconds -- which is common -- trips a fixed
+                // three-second timeout every time, dropping and re-acquiring
+                // lock indefinitely and disturbing the clock servo with it.
+                int intervalMs = config_.announceIntervalMs;
+                const int logInterval = currentMaster_.logAnnounceInterval;
+                if (logInterval >= -4 && logInterval <= 4) {
+                    intervalMs = (logInterval >= 0)
+                        ? (1000 << logInterval)
+                        : (1000 >> (-logInterval));
+                }
+
+                int timeoutMs = intervalMs * config_.announceTimeoutMultiplier;
                 if (elapsed > timeoutMs) {
                     std::cerr << "[PTPSlave] Announce timeout — master lost after "
                               << elapsed << "ms" << std::endl;
