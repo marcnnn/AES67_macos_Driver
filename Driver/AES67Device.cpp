@@ -34,7 +34,12 @@ AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
         .DeviceUID = "com.aes67.driver.device",
         .ModelUID = "com.aes67.driver.model",
         .CanBeDefault = true,
-        .CanBeDefaultForSystemSounds = false
+        .CanBeDefaultForSystemSounds = false,
+        // Without these libASPL advertises its own defaults -- 44100Hz and 2
+        // channels -- which contradicts the streams this device actually
+        // builds, so the device reports a nominal rate it never uses.
+        .SampleRate = static_cast<UInt32>(kDefaultSampleRate),
+        .ChannelCount = static_cast<UInt32>(kNumChannels)
     })
     // Initialize ring buffers sized for maximum supported sample rate (384kHz)
     // This ensures buffers are always large enough regardless of sample rate changes

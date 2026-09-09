@@ -32,6 +32,11 @@ class AES67Device : public aspl::Device {
 public:
     static constexpr size_t kNumChannels = 128;
 
+    // Nominal sample rate the device advertises to Core Audio. AES67 runs at
+    // 48kHz, so start there rather than inheriting libASPL's 44100 default --
+    // otherwise the device reports a nominal rate its own streams do not use.
+    static constexpr Float64 kDefaultSampleRate = 48000.0;
+
     // Supported sample rates
     static constexpr std::array<Float64, 8> kSupportedSampleRates = {
         44100.0, 48000.0, 88200.0, 96000.0,
@@ -167,7 +172,7 @@ private:
     std::unique_ptr<RTSafeStreamInterface> rtInterface_;
 
     // Current configuration
-    std::atomic<Float64> currentSampleRate_{48000.0};
+    std::atomic<Float64> currentSampleRate_{kDefaultSampleRate};
     std::atomic<UInt32> currentBufferSize_{64};
 
     // State
