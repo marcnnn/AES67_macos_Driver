@@ -198,7 +198,13 @@ void RTPTransmitter::transmitLoop() {
     constexpr int64_t  kMediaSnapThresholdNs  = 20000000;  // 20ms: slewing is hopeless
 
     int  packetsSinceMediaSync = kPacketsPerMediaSync;  // check on the first packet
-    bool resyncToMediaClock = false;
+
+    // Snap on the first check rather than slewing to it. The schedule starts
+    // wherever the thread happened to begin, which measured ~4ms away from the
+    // media clock; slewing there at the clamped correction rate takes over a
+    // second, and every packet sent in the meantime is late. There is nothing
+    // to preserve at this point, so take the offset in one step.
+    bool resyncToMediaClock = true;
 
     while (running_) {
         // Pace on the local clock, corrected slowly towards the media clock.
@@ -244,11 +250,15 @@ void RTPTransmitter::transmitLoop() {
 
                     if (resyncToMediaClock || errorNs > kMediaSnapThresholdNs ||
                         errorNs < -kMediaSnapThresholdNs) {
-                        // Too far out to slew: this is a fresh anchor or the
-                        // clock jumped. Take it in one step.
+                        // Nothing worth slewing to: a fresh anchor, or the clock
+                        // jumped. Place the schedule where the media clock says
+                        // this packet is due, in one step. A positive error
+                        // means we are late, so the deadline moves earlier.
+                        const int64_t clamped = std::clamp(errorNs,
+                                                           -kMediaSnapThresholdNs,
+                                                           kMediaSnapThresholdNs);
                         nextTransmitTime = std::chrono::steady_clock::now() -
-                                           std::chrono::nanoseconds(std::min<int64_t>(
-                                               std::max<int64_t>(errorNs, 0), kMediaSnapThresholdNs));
+                                           std::chrono::nanoseconds(clamped);
                         resyncToMediaClock = false;
                     } else {
                         int64_t correctionNs =
