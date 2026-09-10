@@ -5,6 +5,7 @@
 //
 
 #include "AES67Device.h"
+#include <algorithm>
 #include "AES67IOHandler.h"
 #include "SDPParser.h"
 #include "DebugLog.h"
@@ -353,6 +354,88 @@ std::string AES67Device::GetDeviceManufacturer() const {
 
 std::string AES67Device::GetDeviceUID() const {
     return "com.aes67.driver.device";
+}
+
+//
+// Media Clock Steering
+//
+
+void AES67Device::UpdateClockSteering() {
+    // Use the fullest receive buffer as the error signal. Only mapped channels
+    // are ever written, so the unused ones sit at zero and the busiest active
+    // stream is what we track.
+    size_t fill = 0;
+    size_t capacity = 0;
+    for (auto& buffer : inputBuffers_) {
+        const size_t available = buffer.available();
+        if (available > fill) {
+            fill = available;
+            capacity = buffer.capacity();
+        }
+    }
+
+    if (fill == 0 || capacity == 0) {
+        // Nothing arriving: there is no rate to track, and holding the last
+        // correction would drift the clock for no reason.
+        steeringIntegralPpm_ = 0.0;
+        clockRatio_.store(1.0, std::memory_order_release);
+        return;
+    }
+
+    const double target = static_cast<double>(capacity) * kTargetFillFraction;
+    const double errorSamples = static_cast<double>(fill) - target;
+
+    // A filling buffer means audio is arriving faster than Core Audio consumes
+    // it, so the reported clock has to run faster to drain it.
+    steeringIntegralPpm_ += kSteeringIntegral * errorSamples;
+    steeringIntegralPpm_ = std::min(kMaxSteeringPpm,
+                                    std::max(-kMaxSteeringPpm, steeringIntegralPpm_));
+
+    double correctionPpm = kSteeringProportional * errorSamples + steeringIntegralPpm_;
+    correctionPpm = std::min(kMaxSteeringPpm, std::max(-kMaxSteeringPpm, correctionPpm));
+
+    clockRatio_.store(1.0 + correctionPpm / 1e6, std::memory_order_release);
+}
+
+OSStatus AES67Device::GetZeroTimeStampImpl(UInt32 clientID,
+                                           Float64* outSampleTime,
+                                           UInt64* outHostTime,
+                                           UInt64* outSeed) {
+    // Called once per zero-timestamp period, which is one second by default --
+    // ample for a drift measured in a few samples per second.
+    UpdateClockSteering();
+
+    const OSStatus status =
+        aspl::Device::GetZeroTimeStampImpl(clientID, outSampleTime, outHostTime, outSeed);
+    if (status != kAudioHardwareNoError) {
+        return status;
+    }
+
+    if (outSampleTime == nullptr) {
+        return status;
+    }
+
+    // Core Audio infers our rate from how far sampleTime advances per unit of
+    // hostTime, so scaling the advance is what tells it to consume faster or
+    // slower. Scale the *increment*, not the running total: the ratio changes
+    // as the loop tracks the buffer, and multiplying an absolute timeline by a
+    // moving factor would jump it every time -- at a sample time of 48,000,000
+    // even a 20ppm change is a 960-sample discontinuity.
+    const double raw = *outSampleTime;
+    const double ratio = clockRatio_.load(std::memory_order_acquire);
+
+    if (!steeringInitialised_ || raw < lastRawSampleTime_) {
+        // First call, or the HAL restarted its anchor. Adopt the raw timeline.
+        steeredSampleTime_ = raw;
+        lastRawSampleTime_ = raw;
+        steeringInitialised_ = true;
+    } else {
+        steeredSampleTime_ += (raw - lastRawSampleTime_) * ratio;
+        lastRawSampleTime_ = raw;
+    }
+
+    *outSampleTime = steeredSampleTime_;
+    return status;
 }
 
 OSStatus AES67Device::StartIOImpl(UInt32 clientID, UInt32 startCount) {

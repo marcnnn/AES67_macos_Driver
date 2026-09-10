@@ -130,6 +130,30 @@ public:
     OSStatus StopIOImpl(UInt32 clientID, UInt32 startCount) override;
 
     //
+    // Media Clock
+    //
+
+    /// Report the device's timeline to Core Audio, steered to the rate audio is
+    /// actually arriving from the network.
+    ///
+    /// A virtual device owns its clock, and the default implementation runs it
+    /// at exactly the nominal rate off the host clock. That is wrong here: the
+    /// sender's clock and this machine's differ by tens of ppm -- measured at
+    /// -42.7ppm against the console -- so samples arrive at a rate Core Audio
+    /// does not consume at, and the receive ring buffer walks steadily to an
+    /// extreme and overruns. At that rate it takes about eight minutes.
+    ///
+    /// Steering the reported timeline instead of resampling costs no latency
+    /// and adds no conversion artifacts.
+    OSStatus GetZeroTimeStampImpl(UInt32 clientID,
+                                  Float64* outSampleTime,
+                                  UInt64* outHostTime,
+                                  UInt64* outSeed) override;
+
+    /// Ratio of the reported clock rate to nominal. 1.0 means unsteered.
+    double GetClockRatio() const { return clockRatio_.load(std::memory_order_acquire); }
+
+    //
     // Statistics
     //
 
@@ -170,6 +194,47 @@ private:
     // RT-safe interface (compile-time boundary for IO handler)
     // Created during Initialize(), references inputBuffers_/outputBuffers_/atomics
     std::unique_ptr<RTSafeStreamInterface> rtInterface_;
+
+    /// Update clockRatio_ from how full the receive ring buffers are.
+    /// Buffer occupancy is the error signal rather than PTP: it measures the
+    /// rate mismatch that actually matters directly, needs no clock lock, and
+    /// carries far less noise than a software-timestamped PTP offset.
+    void UpdateClockSteering();
+
+    // --- Media clock steering ---
+    std::atomic<double> clockRatio_{1.0};
+
+    // Integral accumulator, in ppm. Only touched by UpdateClockSteering().
+    double steeringIntegralPpm_{0.0};
+
+    // The steered timeline is accumulated from scaled increments of the HAL's
+    // own, so that a change of ratio bends the clock rather than stepping it.
+    // Touched only from GetZeroTimeStampImpl, which the HAL serialises.
+    double steeredSampleTime_{0.0};
+    double lastRawSampleTime_{0.0};
+    bool   steeringInitialised_{false};
+
+    // Fill level the steering aims to hold, as a fraction of buffer capacity.
+    // Half leaves equal room to absorb a burst or a gap.
+    static constexpr double kTargetFillFraction = 0.5;
+
+    // PI gains, in ppm of clock correction per sample of fill error.
+    //
+    // The buffer already integrates rate error into fill, so feeding the error
+    // into an accumulator as well makes a double integrator, which oscillates:
+    // in simulation a pure integral term swung between +11 and +85ppm around a
+    // true +42.7. The proportional term sets rate directly from fill error,
+    // which is first order and settles; the integral term then removes the
+    // offset a proportional-only loop would leave.
+    //
+    // Simulated against the measured -42.7ppm: settles on +42.70ppm with the
+    // buffer at 50.0% and a worst deviation of 3 samples after settling.
+    static constexpr double kSteeringProportional = 0.4;
+    static constexpr double kSteeringIntegral     = 0.002;
+
+    // No crystal is off by more than this, so a larger correction means the
+    // error signal is wrong rather than the clock.
+    static constexpr double kMaxSteeringPpm = 200.0;
 
     // Current configuration
     std::atomic<Float64> currentSampleRate_{kDefaultSampleRate};
