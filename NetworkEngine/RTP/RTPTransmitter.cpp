@@ -5,6 +5,7 @@
 //
 
 #include "RTPTransmitter.h"
+#include <algorithm>
 #include "SimpleRTP.h"
 #include "../../Driver/DebugLog.h"
 #include <cstring>
@@ -189,57 +190,81 @@ void RTPTransmitter::transmitLoop() {
     const uint64_t sendAheadNs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(sendAhead_).count());
 
+    // How often to check the schedule against the media clock. Every packet is
+    // too often -- it is the clock's noise that would be tracked, not its rate.
+    constexpr int      kPacketsPerMediaSync   = 64;
+    constexpr double   kMediaSyncGain         = 0.25;
+    constexpr int64_t  kMaxMediaCorrectionNs  = 200000;    // 200us per correction
+    constexpr int64_t  kMediaSnapThresholdNs  = 20000000;  // 20ms: slewing is hopeless
+
+    int  packetsSinceMediaSync = kPacketsPerMediaSync;  // check on the first packet
+    bool resyncToMediaClock = false;
+
     while (running_) {
-        // Pace against the media clock rather than the local one.
+        // Pace on the local clock, corrected slowly towards the media clock.
         //
-        // The receiver judges every packet against the grandmaster's clock,
-        // and the local clock runs at a measurably different rate -- tens of
-        // ppm here. Advancing a local-clock schedule by a fixed interval per
-        // packet therefore walks steadily away from the media clock, and a
-        // stream that starts comfortably inside the receiver's window drifts
-        // out of it. Deriving each packet's send instant from the media clock
-        // directly leaves nothing to accumulate.
+        // Either clock alone is wrong. A purely local schedule advances by a
+        // fixed interval per packet and so walks away from the grandmaster at
+        // the crystal difference -- tens of ppm here -- until the stream falls
+        // outside the receiver's window. But deriving every send instant from
+        // the media clock instead puts that clock's own noise straight into
+        // the send timing: the estimate carries tens of microseconds of
+        // jitter and steps whenever the servo updates, and sleeping for a
+        // freshly computed relative duration also folds in each wakeup's
+        // overshoot. That shows up as a thin tail of late packets.
+        //
+        // So: advance an absolute deadline on the local clock, which is smooth,
+        // and periodically nudge it towards where the media clock says it
+        // should be, which removes the drift. Corrections are a fraction of the
+        // measured error and clamped, so clock noise is averaged out rather
+        // than transmitted.
         if (mediaClockSource_) {
-            // PTP may not have locked when the stream started -- it takes a few
-            // seconds -- so anchor on the first reading that is actually
-            // available rather than being stuck with an unusable zero anchor
-            // for the life of the stream.
             if (mediaTicks_ == 0) {
+                // PTP may not have locked when the stream started -- it takes a
+                // few seconds -- so anchor on the first reading that is
+                // actually available rather than being stuck with an unusable
+                // zero anchor for the life of the stream.
                 const uint64_t anchor = computeInitialMediaTicks();
                 if (anchor != 0) {
                     mediaTicks_ = anchor;
                     timestamp_ = static_cast<uint32_t>(mediaTicks_ & 0xFFFFFFFFULL);
+                    resyncToMediaClock = true;
                 }
             }
 
-            const uint64_t targetNs = mediaTicksToNs(mediaTicks_);
-            const uint64_t nowNs = mediaClockSource_();
+            if (++packetsSinceMediaSync >= kPacketsPerMediaSync || resyncToMediaClock) {
+                packetsSinceMediaSync = 0;
 
-            if (nowNs == 0) {
-                // No PTP lock. Fall back to the local schedule: without this
-                // the loop has nothing to wait on and spins, sending flat out
-                // and burning a core, which is far worse than a stream whose
-                // timestamps are merely not yet aligned.
-                std::this_thread::sleep_until(nextTransmitTime);
-                nextTransmitTime += packetInterval_;
-            } else {
-                if (targetNs > nowNs + sendAheadNs) {
-                    const uint64_t waitNs = targetNs - nowNs - sendAheadNs;
-                    // A wait longer than a moment means the clock jumped; fall
-                    // through and send rather than stalling the stream.
-                    if (waitNs < 100000000ULL) {
-                        std::this_thread::sleep_for(std::chrono::nanoseconds(waitNs));
+                const uint64_t nowNs = mediaClockSource_();
+                if (nowNs != 0) {
+                    // Where the media clock should be as this packet goes out.
+                    const int64_t idealNs = static_cast<int64_t>(mediaTicksToNs(mediaTicks_)) -
+                                            static_cast<int64_t>(sendAheadNs);
+                    const int64_t errorNs = static_cast<int64_t>(nowNs) - idealNs;
+
+                    if (resyncToMediaClock || errorNs > kMediaSnapThresholdNs ||
+                        errorNs < -kMediaSnapThresholdNs) {
+                        // Too far out to slew: this is a fresh anchor or the
+                        // clock jumped. Take it in one step.
+                        nextTransmitTime = std::chrono::steady_clock::now() -
+                                           std::chrono::nanoseconds(std::min<int64_t>(
+                                               std::max<int64_t>(errorNs, 0), kMediaSnapThresholdNs));
+                        resyncToMediaClock = false;
+                    } else {
+                        int64_t correctionNs =
+                            static_cast<int64_t>(static_cast<double>(errorNs) * kMediaSyncGain);
+                        correctionNs = std::clamp(correctionNs,
+                                                  -kMaxMediaCorrectionNs,
+                                                  kMaxMediaCorrectionNs);
+                        // Late means the deadline should move earlier.
+                        nextTransmitTime -= std::chrono::nanoseconds(correctionNs);
                     }
                 }
-                // Keep the fallback schedule tracking real time, so switching
-                // to it later does not resume from a stale point.
-                nextTransmitTime = std::chrono::steady_clock::now() + packetInterval_;
             }
-        } else {
-            // No media clock: keep the fixed local schedule.
-            std::this_thread::sleep_until(nextTransmitTime);
-            nextTransmitTime += packetInterval_;
         }
+
+        std::this_thread::sleep_until(nextTransmitTime);
+        nextTransmitTime += packetInterval_;
 
         // Read audio from device channels (silence-fills on underrun)
         // Always send packets even with empty ring buffers — AES67 requires
