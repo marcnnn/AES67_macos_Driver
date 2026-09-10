@@ -276,6 +276,9 @@ StreamID StreamManager::createTxStream(
     completeMapping.streamName = name;
     completeMapping.streamChannelCount = numChannels;
     completeMapping.deviceChannelCount = numChannels;
+    // Transmit streams read the device's output channels, which are a separate
+    // namespace from the inputs a receive stream writes to.
+    completeMapping.isTransmit = true;
 
     // Add mapping
     if (!mapper_.addMapping(completeMapping)) {
@@ -327,6 +330,10 @@ StreamID StreamManager::createTxStream(
     streams_[id] = std::move(managed);
 
     // Notify callback
+    // Advertise immediately, independently of whether Core Audio IO is
+    // running: discovery has to work before anyone opens the device.
+    startAnnouncingTxStreams();
+
     notifyStreamAdded(streams_[id].info);
 
     // Auto-save configuration
@@ -498,12 +505,13 @@ void StreamManager::setIOActive(bool active) {
                 managed.transmitter->start();
             }
         }
-        startAnnouncingTxStreams();
     } else {
         AES67_LOGF("StreamManager::setIOActive: Stopping %zu stream(s)", streams_.size());
-        // Withdraw the announcements before the transmitters go quiet, so a
-        // receiver drops the subscription rather than sitting on a dead stream.
-        stopAnnouncingTxStreams();
+        // Announcements deliberately keep running here. A receiver has to be
+        // able to see a transmit stream in order to route it, and nothing will
+        // have the device open at that moment -- tying advertisement to the IO
+        // lifecycle made the stream invisible exactly when someone wanted to
+        // subscribe. Real AES67 hardware advertises continuously.
         for (auto& [id, managed] : streams_) {
             if (managed.receiver) {
                 managed.receiver->stop();
@@ -812,8 +820,19 @@ bool StreamManager::loadSavedStreams() {
             continue;
         }
 
+        const bool isTransmit = (config.sdp.direction == "sendonly" ||
+                                 config.sdp.direction == "sendrecv");
+
+        // Tag the mapping's direction before registering it. A saved mapping
+        // may predate this field or come from an older build, so derive it from
+        // the session direction rather than trusting what is on disk -- and do
+        // it here, because the mapper needs it to decide which side's channels
+        // the stream occupies.
+        ChannelMapping loadedMapping = config.mapping;
+        loadedMapping.isTransmit = isTransmit;
+
         // Add mapping to mapper
-        if (!mapper_.addMapping(config.mapping)) {
+        if (!mapper_.addMapping(loadedMapping)) {
             AES67_LOGF("StreamManager: Failed to add mapping for stream: %s",
                       config.sdp.sessionName.c_str());
             failedCount++;
@@ -823,8 +842,8 @@ bool StreamManager::loadSavedStreams() {
         // Create managed stream
         ManagedStream managed;
         managed.sdp = config.sdp;
-        managed.mapping = config.mapping;
-        managed.isTransmit = (config.sdp.direction == "sendonly" || config.sdp.direction == "sendrecv");
+        managed.mapping = loadedMapping;
+        managed.isTransmit = isTransmit;
         // Needed by the SAP announcer to advertise from the same interface the
         // stream transmits on; without it a saved TX stream would be announced
         // via the default route, which on a multi-homed host is the wrong
@@ -900,6 +919,10 @@ bool StreamManager::loadSavedStreams() {
 
     AES67_LOGF("StreamManager: Loaded %d streams successfully, %d failed",
               loadedCount, failedCount);
+
+    // Advertise restored transmit streams straight away, so a stream survives
+    // a restart as something other devices can still see and subscribe to.
+    startAnnouncingTxStreams();
 
     return loadedCount > 0;
 }

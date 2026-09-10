@@ -26,6 +26,12 @@ struct ChannelMapping {
     uint16_t deviceChannelStart{0};      ///< First device channel (0-127)
     uint16_t deviceChannelCount{0};      ///< Number of channels to map
 
+    /// Which side of the device this occupies. A Core Audio device has 128
+    /// input and 128 output channels independently, so a receive stream on
+    /// device channels 0-7 does not conflict with a transmit stream on the
+    /// same numbers -- they are different buffers entirely.
+    bool isTransmit{false};
+
     /// Per-channel custom routing. If empty, sequential: streamCh[i] -> deviceCh[start+i].
     std::vector<int> channelMap;
 
@@ -107,22 +113,22 @@ public:
     //
 
     // Get which stream owns a specific device channel
-    std::optional<StreamID> getStreamForDeviceChannel(int deviceCh) const;
+    std::optional<StreamID> getStreamForDeviceChannel(int deviceCh, bool transmit = false) const;
 
     // Get all unassigned device channels
-    std::vector<int> getUnassignedDeviceChannels() const;
+    std::vector<int> getUnassignedDeviceChannels(bool transmit = false) const;
 
     // Get number of available channels
-    size_t getAvailableChannelCount() const;
+    size_t getAvailableChannelCount(bool transmit = false) const;
 
     // Get number of used channels
-    size_t getUsedChannelCount() const;
+    size_t getUsedChannelCount(bool transmit = false) const;
 
     // Check if device channel is assigned
-    bool isChannelAssigned(int deviceCh) const;
+    bool isChannelAssigned(int deviceCh, bool transmit = false) const;
 
     /// Find first contiguous block of N free channels. Returns start index or nullopt.
-    std::optional<int> findContiguousBlock(size_t numChannels) const;
+    std::optional<int> findContiguousBlock(size_t numChannels, bool transmit = false) const;
 
     //
     // Persistence
@@ -144,9 +150,17 @@ private:
     // Internal storage
     std::map<StreamID, ChannelMapping> mappings_;
 
-    // Fast lookup: deviceChannel → streamID
-    // Uses StreamID::null() for unassigned channels
-    std::array<StreamID, kMaxDeviceChannels> deviceChannelOwners_;
+    // Fast lookup: deviceChannel → streamID, one table per direction.
+    // Uses StreamID::null() for unassigned channels.
+    std::array<StreamID, kMaxDeviceChannels> inputChannelOwners_;
+    std::array<StreamID, kMaxDeviceChannels> outputChannelOwners_;
+
+    std::array<StreamID, kMaxDeviceChannels>& ownersFor(bool transmit) {
+        return transmit ? outputChannelOwners_ : inputChannelOwners_;
+    }
+    const std::array<StreamID, kMaxDeviceChannels>& ownersFor(bool transmit) const {
+        return transmit ? outputChannelOwners_ : inputChannelOwners_;
+    }
 
     // Thread safety for concurrent access
     mutable std::mutex mutex_;

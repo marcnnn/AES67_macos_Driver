@@ -123,7 +123,15 @@ bool RTPReceiver::start() {
     // Start receive thread (producer - adds packets to jitter buffer)
     running_ = true;
     receiveThread_ = std::thread([this]() {
-        if (!AudioThreadPriority::configureForRealTime()) {
+        // Ask for deadline scheduling on the packet cadence. configureForRealTime()
+        // alone only marks the thread non-timeshared and raises its precedence,
+        // which is not enough to stop a 1ms wakeup landing milliseconds late --
+        // and on this platform it fails outright, so the receive path was running
+        // with no real-time guarantee at all while feeding the audio callback.
+        const uint64_t periodNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(packetInterval_).count());
+        if (periodNs == 0 ||
+            !AudioThreadPriority::configureForRealTimePeriodic(periodNs, periodNs / 4)) {
             AES67_LOGF("RTPReceiver: failed to set RT priority on receive thread (stream=%s)",
                        sdp_.sessionName.c_str());
         }
@@ -132,7 +140,10 @@ bool RTPReceiver::start() {
 
     // Start consume thread (consumer - reads from jitter buffer and writes to ring buffers)
     consumeThread_ = std::thread([this]() {
-        if (!AudioThreadPriority::configureForRealTime()) {
+        const uint64_t periodNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(packetInterval_).count());
+        if (periodNs == 0 ||
+            !AudioThreadPriority::configureForRealTimePeriodic(periodNs, periodNs / 4)) {
             AES67_LOGF("RTPReceiver: failed to set RT priority on consume thread (stream=%s)",
                        sdp_.sessionName.c_str());
         }

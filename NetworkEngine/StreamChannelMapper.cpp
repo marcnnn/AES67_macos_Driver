@@ -63,10 +63,9 @@ bool ChannelMapping::containsDeviceChannel(int deviceCh) const {
 // ============================================================================
 
 StreamChannelMapper::StreamChannelMapper() {
-    // Initialize all device channels as unassigned
-    for (auto& owner : deviceChannelOwners_) {
-        owner = StreamID::null();
-    }
+    // Initialize all device channels as unassigned, on both sides
+    for (auto& owner : inputChannelOwners_)  owner = StreamID::null();
+    for (auto& owner : outputChannelOwners_) owner = StreamID::null();
 }
 
 StreamChannelMapper::~StreamChannelMapper() = default;
@@ -158,9 +157,8 @@ void StreamChannelMapper::clearAll() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     mappings_.clear();
-    for (auto& owner : deviceChannelOwners_) {
-        owner = StreamID::null();
-    }
+    for (auto& owner : inputChannelOwners_)  owner = StreamID::null();
+    for (auto& owner : outputChannelOwners_) owner = StreamID::null();
 }
 
 std::optional<ChannelMapping> StreamChannelMapper::createDefaultMapping(const SDPSession& sdp) {
@@ -221,7 +219,7 @@ std::vector<StreamID> StreamChannelMapper::getOverlappingStreams(const ChannelMa
 
     for (uint16_t i = 0; i < mapping.deviceChannelCount; i++) {
         int deviceCh = mapping.deviceChannelStart + i;
-        const StreamID& owner = deviceChannelOwners_[deviceCh];
+        const StreamID& owner = ownersFor(mapping.isTransmit)[deviceCh];
 
         if (!owner.isNull() && owner != mapping.streamID) {
             if (std::find(overlaps.begin(), overlaps.end(), owner) == overlaps.end()) {
@@ -233,14 +231,14 @@ std::vector<StreamID> StreamChannelMapper::getOverlappingStreams(const ChannelMa
     return overlaps;
 }
 
-std::optional<StreamID> StreamChannelMapper::getStreamForDeviceChannel(int deviceCh) const {
+std::optional<StreamID> StreamChannelMapper::getStreamForDeviceChannel(int deviceCh, bool transmit) const {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (deviceCh < 0 || deviceCh >= static_cast<int>(kMaxDeviceChannels)) {
         return std::nullopt;
     }
 
-    const StreamID& owner = deviceChannelOwners_[deviceCh];
+    const StreamID& owner = ownersFor(transmit)[deviceCh];
     if (owner.isNull()) {
         return std::nullopt;
     }
@@ -248,12 +246,13 @@ std::optional<StreamID> StreamChannelMapper::getStreamForDeviceChannel(int devic
     return owner;
 }
 
-std::vector<int> StreamChannelMapper::getUnassignedDeviceChannels() const {
+std::vector<int> StreamChannelMapper::getUnassignedDeviceChannels(bool transmit) const {
     std::lock_guard<std::mutex> lock(mutex_);
 
     std::vector<int> unassigned;
+    const auto& owners = ownersFor(transmit);
     for (size_t i = 0; i < kMaxDeviceChannels; i++) {
-        if (deviceChannelOwners_[i].isNull()) {
+        if (owners[i].isNull()) {
             unassigned.push_back(static_cast<int>(i));
         }
     }
@@ -261,32 +260,33 @@ std::vector<int> StreamChannelMapper::getUnassignedDeviceChannels() const {
     return unassigned;
 }
 
-size_t StreamChannelMapper::getAvailableChannelCount() const {
-    return getUnassignedDeviceChannels().size();
+size_t StreamChannelMapper::getAvailableChannelCount(bool transmit) const {
+    return getUnassignedDeviceChannels(transmit).size();
 }
 
-size_t StreamChannelMapper::getUsedChannelCount() const {
-    return kMaxDeviceChannels - getAvailableChannelCount();
+size_t StreamChannelMapper::getUsedChannelCount(bool transmit) const {
+    return kMaxDeviceChannels - getAvailableChannelCount(transmit);
 }
 
-bool StreamChannelMapper::isChannelAssigned(int deviceCh) const {
+bool StreamChannelMapper::isChannelAssigned(int deviceCh, bool transmit) const {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (deviceCh < 0 || deviceCh >= static_cast<int>(kMaxDeviceChannels)) {
         return false;
     }
 
-    return !deviceChannelOwners_[deviceCh].isNull();
+    return !ownersFor(transmit)[deviceCh].isNull();
 }
 
-std::optional<int> StreamChannelMapper::findContiguousBlock(size_t numChannels) const {
+std::optional<int> StreamChannelMapper::findContiguousBlock(size_t numChannels, bool transmit) const {
     // Note: Caller must hold lock
 
     int consecutiveCount = 0;
     int blockStart = -1;
 
+    const auto& owners = ownersFor(transmit);
     for (size_t i = 0; i < kMaxDeviceChannels; i++) {
-        if (deviceChannelOwners_[i].isNull()) {
+        if (owners[i].isNull()) {
             if (blockStart == -1) {
                 blockStart = static_cast<int>(i);
             }
@@ -371,13 +371,13 @@ void StreamChannelMapper::updateDeviceChannelOwners(const ChannelMapping& mappin
         // Sequential mapping
         for (uint16_t i = 0; i < mapping.deviceChannelCount; i++) {
             int deviceCh = mapping.deviceChannelStart + i;
-            deviceChannelOwners_[deviceCh] = mapping.streamID;
+            ownersFor(mapping.isTransmit)[deviceCh] = mapping.streamID;
         }
     } else {
         // Custom mapping
         for (int deviceCh : mapping.channelMap) {
             if (deviceCh >= 0 && deviceCh < static_cast<int>(kMaxDeviceChannels)) {
-                deviceChannelOwners_[deviceCh] = mapping.streamID;
+                ownersFor(mapping.isTransmit)[deviceCh] = mapping.streamID;
             }
         }
     }
@@ -386,7 +386,16 @@ void StreamChannelMapper::updateDeviceChannelOwners(const ChannelMapping& mappin
 void StreamChannelMapper::clearDeviceChannelOwners(const StreamID& streamID) {
     // Note: Caller must hold lock
 
-    for (auto& owner : deviceChannelOwners_) {
+    // Clear both sides: the caller does not tell us which the stream was on,
+    // and a stream id only ever occupies one of them, so this cannot clear
+    // another stream's channels.
+    for (auto& owner : outputChannelOwners_) {
+        if (owner == streamID) {
+            owner = StreamID::null();
+        }
+    }
+
+    for (auto& owner : inputChannelOwners_) {
         if (owner == streamID) {
             owner = StreamID::null();
         }
@@ -403,7 +412,7 @@ bool StreamChannelMapper::isOverlapWithStream(const ChannelMapping& mapping, con
 
     for (uint16_t i = 0; i < mapping.deviceChannelCount; i++) {
         int deviceCh = mapping.deviceChannelStart + i;
-        const StreamID& owner = deviceChannelOwners_[deviceCh];
+        const StreamID& owner = ownersFor(mapping.isTransmit)[deviceCh];
 
         if (!owner.isNull() && owner != excludeStream) {
             return true;  // Overlap detected
