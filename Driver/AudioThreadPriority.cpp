@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <mach/mach_time.h>
 #include <algorithm>
+#include <atomic>
 
 namespace AES67 {
 
@@ -114,8 +115,15 @@ bool AudioThreadPriority::configureThreadForRealTime(pthread_t thread) {
     );
 
     if (result != KERN_SUCCESS) {
-        fprintf(stderr, "AES67 AudioThreadPriority: THREAD_AFFINITY_POLICY failed (kern_return=%d: %s) - non-critical\n",
-                result, mach_error_string(result));
+        // Affinity tags are not supported at all on Apple Silicon, so this
+        // fails for every thread we configure. It is genuinely non-critical,
+        // but reporting it each time buries the failures that do matter --
+        // several hundred copies of this line accumulated in one session.
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            fprintf(stderr, "AES67 AudioThreadPriority: THREAD_AFFINITY_POLICY failed (kern_return=%d: %s) - non-critical, not reported again\n",
+                    result, mach_error_string(result));
+        }
     }
 
     return result == KERN_SUCCESS;
