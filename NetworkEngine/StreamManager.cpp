@@ -707,7 +707,26 @@ std::unique_ptr<RTPTransmitter> StreamManager::createTransmitter(
     // to place our samples on its own playout timeline, so without this the
     // stream decodes but is reported as carrying no data.
     SDPSession sdpCopy = sdp;
-    transmitter->setMediaClockSource([sdpCopy]() -> uint64_t {
+    auto sharedClock = std::make_shared<SharedPTPClockReader>();
+
+    transmitter->setMediaClockSource([sdpCopy, sharedClock]() -> uint64_t {
+        // Prefer an external agent's clock. Hosted inside coreaudiod the
+        // driver does not manage to run a PTP slave of its own, so without an
+        // agent the timestamps below are unavailable and the stream goes out
+        // unaligned. The agent may also start after the driver, hence the
+        // retry rather than a one-shot open at construction.
+        if (!sharedClock->isOpen()) {
+            sharedClock->open();
+        }
+        if (sharedClock->isOpen()) {
+            const uint64_t t = sharedClock->getMasterTimeNs();
+            if (t != 0) {
+                return t;
+            }
+            // Agent present but not locked, or its sample went stale. Fall
+            // through: an in-process slave might still be working.
+        }
+
         // PTPClockManager is a singleton and outlives every stream, so the
         // lambda can reach it directly. The member this used to go through was
         // never assigned, so the clock source was never installed and every

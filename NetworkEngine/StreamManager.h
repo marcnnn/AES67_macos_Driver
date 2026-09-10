@@ -11,6 +11,7 @@
 #include "RTP/RTPReceiver.h"
 #include "RTP/RTPTransmitter.h"
 #include "PTP/PTPClock.h"
+#include "PTP/SharedPTPClock.h"
 #include "Discovery/SAPAnnouncer.h"
 #include <map>
 #include <memory>

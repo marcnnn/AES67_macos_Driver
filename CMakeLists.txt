@@ -132,6 +132,7 @@ set(NETWORK_SOURCES
     NetworkEngine/RTP/LockFreePacketPool.cpp
     NetworkEngine/RTP/BufferStatusMonitor.cpp
     NetworkEngine/PTP/PTPClock.cpp
+    NetworkEngine/PTP/SharedPTPClock.cpp
     NetworkEngine/PTP/PTPDInterface.cpp
     NetworkEngine/PTP/PTPSlave.cpp
     NetworkEngine/PTP/CustomSys.cpp

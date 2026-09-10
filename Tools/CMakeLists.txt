@@ -27,9 +27,24 @@ target_include_directories(AES67TestReceiver PRIVATE
 
 target_compile_features(AES67TestReceiver PRIVATE cxx_std_17)
 
+# AES67 PTP Agent: runs the PTP slave outside coreaudiod and publishes
+# grandmaster time for the driver to use as its media clock
+add_executable(AES67PTPAgent
+    AES67PTPAgent.cpp
+    ../NetworkEngine/PTP/PTPSlave.cpp
+    ../NetworkEngine/PTP/SharedPTPClock.cpp
+)
+
+target_include_directories(AES67PTPAgent PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_compile_features(AES67PTPAgent PRIVATE cxx_std_17)
+
 message(STATUS "Tools configured:")
 message(STATUS "  - AES67TestSender")
 message(STATUS "  - AES67TestReceiver")
+message(STATUS "  - AES67PTPAgent")
 message(STATUS "")
 message(STATUS "Run test sender:")
 message(STATUS "  ./Tools/AES67TestSender --ip 239.1.1.1 --port 5004 --channels 8 --freq 1000")
