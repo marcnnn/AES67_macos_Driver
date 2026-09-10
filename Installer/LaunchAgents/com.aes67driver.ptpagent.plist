@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aes67driver.ptpagent</string>
+
+    <!-- The driver cannot run a PTP slave from inside coreaudiod, so this
+         agent runs one and publishes grandmaster time for it to use as a
+         media clock. It is an agent rather than a daemon because it needs no
+         elevated privileges, and rather than part of the SwiftUI app because
+         the clock has to exist whenever audio is running, not only while
+         someone has a window open. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/AES67PTPAgent</string>
+        <string>--interface</string>
+        <string>en0</string>
+        <string>--domain</string>
+        <string>0</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits for any reason: if the agent goes away the
+         driver's transmitted timestamps stop being aligned within seconds,
+         and receivers reject the stream. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Do not respawn faster than this after a failure, so a persistent
+         problem (no such interface, say) does not spin. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/aes67_ptpagent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/aes67_ptpagent.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
