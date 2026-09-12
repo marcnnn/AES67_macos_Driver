@@ -75,3 +75,6 @@ ManagerApp/.build/
 # Local build output and vendored dependency checkout
 /build/
 /external/
+
+# clangd index
+.cache/
