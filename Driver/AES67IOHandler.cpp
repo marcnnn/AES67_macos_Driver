@@ -49,7 +49,10 @@ void AES67IOHandler::OnReadClientInput(
     const UInt32 bytesPerFrame = cachedBytesPerFrame_;
     const UInt32 frameCount = (bytesPerFrame > 0) ? (bytesCount / bytesPerFrame) : 0;
 
-    if (frameCount == 0 || channelCount != kNumChannels) {
+    // Guard the ring buffer array bound, not the configured count -- the
+    // latter is where channelCount came from, so comparing them proves
+    // nothing.
+    if (frameCount == 0 || channelCount > kNumChannels) {
         std::memset(bytes, 0, bytesCount);
         return;
     }
@@ -82,7 +85,7 @@ void AES67IOHandler::OnWriteClientOutput(
         return;
     }
 
-    if (channelCount != kNumChannels) {
+    if (channelCount != cachedChannelCount_) {
         return;
     }
 

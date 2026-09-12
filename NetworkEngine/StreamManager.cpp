@@ -787,6 +787,16 @@ bool StreamManager::loadSavedStreams() {
     int failedCount = 0;
 
     for (const auto& config : *configs) {
+        // Skip streams belonging to another device.
+        //
+        // A stream naming no device falls to the default manager rather than
+        // to none, so a config written before devices existed still loads.
+        const bool belongsHere = (config.deviceUID == deviceUID_) ||
+                                 (config.deviceUID.empty() && adoptsUnassigned_);
+        if (!belongsHere) {
+            continue;
+        }
+
         // Skip disabled streams
         if (!config.enabled) {
             AES67_LOGF("StreamManager: Skipping disabled stream: %s", config.sdp.sessionName.c_str());

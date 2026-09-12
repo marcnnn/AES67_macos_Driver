@@ -150,7 +150,11 @@ bool StreamConfigManager::saveConfig(const std::vector<PersistedStreamConfig>& c
         return false;
     }
 
-    std::string json = toJSON(configs);
+    // Read the devices back off disk first: this function rewrites the entire
+    // file, and a save triggered by any stream change would otherwise drop the
+    // devices section and collapse a multi-device setup to one device on the
+    // next restart.
+    std::string json = toJSON(configs, loadDevices());
     if (json.empty()) {
         AES67_LOG("StreamConfigManager: Failed to serialize configs to JSON");
         return false;
@@ -165,6 +169,129 @@ bool StreamConfigManager::saveConfig(const std::vector<PersistedStreamConfig>& c
     file << json;
     AES67_LOGF("StreamConfigManager: Saved %zu stream configurations to %s", configs.size(), configPath_.c_str());
     return true;
+}
+
+bool AudioDeviceConfig::isValid() const {
+    if (uid.empty() || name.empty()) {
+        return false;
+    }
+    // Zero channels would publish a device no application can use; above the
+    // ring buffer array bound the device would advertise channels that have
+    // nowhere to be written.
+    return channelCount > 0 && channelCount <= DeviceConfig::kMaxChannels;
+}
+
+std::vector<AudioDeviceConfig> StreamConfigManager::devicesFromJSON(const std::string& json) {
+    std::vector<AudioDeviceConfig> devices;
+
+    const size_t arrayStart = json.find("\"devices\"");
+    if (arrayStart == std::string::npos) {
+        return devices;
+    }
+
+    const size_t bracketStart = json.find('[', arrayStart);
+    if (bracketStart == std::string::npos) {
+        return devices;
+    }
+
+    // Same bracket matching the streams array uses: regex cannot span the
+    // newlines these documents are written with.
+    int depth = 0;
+    size_t bracketEnd = std::string::npos;
+    for (size_t i = bracketStart; i < json.length(); i++) {
+        if (json[i] == '[') depth++;
+        else if (json[i] == ']') {
+            if (--depth == 0) { bracketEnd = i; break; }
+        }
+    }
+    if (bracketEnd == std::string::npos) {
+        AES67_LOG("StreamConfigManager: devices array is not closed - ignoring it");
+        return devices;
+    }
+
+    const std::string content = json.substr(bracketStart + 1, bracketEnd - bracketStart - 1);
+
+    size_t pos = 0;
+    while (pos < content.length()) {
+        const size_t objStart = content.find('{', pos);
+        if (objStart == std::string::npos) break;
+
+        int objDepth = 0;
+        size_t objEnd = std::string::npos;
+        for (size_t i = objStart; i < content.length(); i++) {
+            if (content[i] == '{') objDepth++;
+            else if (content[i] == '}') {
+                if (--objDepth == 0) { objEnd = i; break; }
+            }
+        }
+        if (objEnd == std::string::npos) break;
+
+        const std::string obj = content.substr(objStart, objEnd - objStart + 1);
+
+        AudioDeviceConfig dev;
+        if (auto name = extractStringField(obj, "name")) dev.name = *name;
+        if (auto uid = extractStringField(obj, "uid")) dev.uid = *uid;
+        if (auto ch = extractUInt32Field(obj, "channels")) dev.channelCount = *ch;
+
+        if (dev.isValid()) {
+            devices.push_back(dev);
+        } else {
+            AES67_LOGF("StreamConfigManager: skipping invalid device entry (name='%s' uid='%s' channels=%u)",
+                       dev.name.c_str(), dev.uid.c_str(), dev.channelCount);
+        }
+
+        pos = objEnd + 1;
+    }
+
+    // A duplicate UID does not fail loudly anywhere else: aspl::Plugin indexes
+    // devices by UID and the later one simply replaces the earlier in that
+    // index, leaving a device that exists but cannot be looked up.
+    for (size_t i = 0; i < devices.size(); i++) {
+        for (size_t j = i + 1; j < devices.size(); j++) {
+            if (devices[i].uid == devices[j].uid) {
+                AES67_LOGF("StreamConfigManager: duplicate device uid '%s' - dropping '%s'",
+                           devices[j].uid.c_str(), devices[j].name.c_str());
+                devices.erase(devices.begin() + static_cast<long>(j));
+                j--;
+            }
+        }
+    }
+
+    return devices;
+}
+
+std::vector<AudioDeviceConfig> StreamConfigManager::loadDevices() {
+    std::vector<AudioDeviceConfig> devices;
+
+    std::ifstream file(configPath_);
+    if (file.is_open()) {
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        devices = devicesFromJSON(buffer.str());
+    }
+
+    if (!devices.empty()) {
+        devices.front().adoptsUnassignedStreams = true;
+    }
+
+    if (devices.empty()) {
+        // No devices section, unreadable file, or nothing in it survived
+        // validation. Publish the single device this driver had before the
+        // section existed, so an upgrade never costs someone their audio
+        // device.
+        AudioDeviceConfig fallback;
+        fallback.adoptsUnassignedStreams = true;
+        devices.push_back(fallback);
+        AES67_LOG("StreamConfigManager: no devices configured - publishing the default device");
+    } else {
+        AES67_LOGF("StreamConfigManager: %zu device(s) configured", devices.size());
+        for (const auto& d : devices) {
+            AES67_LOGF("  device '%s' uid=%s channels=%u",
+                       d.name.c_str(), d.uid.c_str(), d.channelCount);
+        }
+    }
+
+    return devices;
 }
 
 std::optional<std::vector<PersistedStreamConfig>> StreamConfigManager::loadConfig() {
@@ -206,10 +333,25 @@ std::optional<std::vector<PersistedStreamConfig>> StreamConfigManager::loadConfi
 // JSON Serialization
 // ============================================================================
 
-std::string StreamConfigManager::toJSON(const std::vector<PersistedStreamConfig>& configs) {
+std::string StreamConfigManager::toJSON(const std::vector<PersistedStreamConfig>& configs,
+                                        const std::vector<AudioDeviceConfig>& devices) {
     std::ostringstream json;
     json << "{\n";
-    json << "  \"version\": \"1.0\",\n";
+    json << "  \"version\": \"1.1\",\n";
+
+    if (!devices.empty()) {
+        json << "  \"devices\": [\n";
+        bool firstDevice = true;
+        for (const auto& dev : devices) {
+            if (!firstDevice) json << ",\n";
+            firstDevice = false;
+            json << "    { \"name\": \"" << escapeJSON(dev.name)
+                 << "\", \"uid\": \"" << escapeJSON(dev.uid)
+                 << "\", \"channels\": " << dev.channelCount << " }";
+        }
+        json << "\n  ],\n";
+    }
+
     json << "  \"streams\": [\n";
 
     bool first = true;
@@ -235,6 +377,7 @@ std::string StreamConfigManager::configToJSON(const PersistedStreamConfig& confi
     json << "      \"modifiedTimestamp\": " << config.modifiedTimestamp << ",\n";
     json << "      \"jitterBufferDepth\": " << config.jitterBufferDepth << ",\n";
     json << "      \"networkInterface\": \"" << escapeJSON(config.networkInterface) << "\",\n";
+    json << "      \"device\": \"" << escapeJSON(config.deviceUID) << "\",\n";
     json << "      \"sdp\": " << sdpToJSON(config.sdp) << ",\n";
     json << "      \"mapping\": " << mappingToJSON(config.mapping) << "\n";
     json << "    }";
@@ -386,6 +529,10 @@ std::optional<PersistedStreamConfig> StreamConfigManager::configFromJSON(const s
 
     if (auto jbDepth = extractUInt64Field(json, "jitterBufferDepth")) {
         config.jitterBufferDepth = static_cast<size_t>(*jbDepth);
+    }
+
+    if (auto device = extractStringField(json, "device")) {
+        config.deviceUID = *device;
     }
 
     if (auto iface = extractStringField(json, "networkInterface")) {

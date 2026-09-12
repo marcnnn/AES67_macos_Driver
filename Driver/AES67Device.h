@@ -51,7 +51,11 @@ public:
     //
     // Constructor
     //
-    explicit AES67Device(std::shared_ptr<aspl::Context> context);
+    // The config names the device and decides how many channels it advertises.
+    // Defaulted so existing callers and tests keep building the single
+    // 128-channel device this driver used to have.
+    explicit AES67Device(std::shared_ptr<aspl::Context> context,
+                         AudioDeviceConfig deviceConfig = AudioDeviceConfig{});
     ~AES67Device();
 
     // Initialize device (must be called after construction)
@@ -83,9 +87,15 @@ public:
     std::string GetDeviceManufacturer() const;
     std::string GetDeviceUID() const override;
 
-    // Get channel count
-    UInt32 GetInputChannelCount() const { return kNumChannels; }
-    UInt32 GetOutputChannelCount() const { return kNumChannels; }
+    // Channels this device advertises to Core Audio. Not kNumChannels: the
+    // ring buffers are always allocated for the maximum, but a device
+    // configured for 2 channels must report 2, or applications will offer the
+    // user 128 outputs of which 126 go nowhere.
+    UInt32 GetInputChannelCount() const { return deviceConfig_.channelCount; }
+    UInt32 GetOutputChannelCount() const { return deviceConfig_.channelCount; }
+
+    /// The device as configured: name, UID and advertised channel count.
+    const AudioDeviceConfig& GetDeviceConfig() const { return deviceConfig_; }
 
     //
     // Stream Access
@@ -174,6 +184,10 @@ private:
     // Returns size for desired latency (default: 3ms for network jitter tolerance)
     // Result is rounded up to power of 2 for efficient modulo operations
     static size_t CalculateRingBufferSize(Float64 sampleRate, double latencyMs = 3.0);
+
+    // What this instance publishes. Fixed at construction -- Core Audio
+    // caches device identity, so changing it later is not a thing.
+    const AudioDeviceConfig deviceConfig_;
 
     // Ring buffers for audio data
     // Network threads write to input buffers, read from output buffers

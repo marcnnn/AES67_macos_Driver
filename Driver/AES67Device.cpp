@@ -28,11 +28,15 @@ namespace {
     }
 }
 
-AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
+AES67Device::AES67Device(std::shared_ptr<aspl::Context> context,
+                         AudioDeviceConfig deviceConfig)
     : aspl::Device(context, aspl::DeviceParameters{
-        .Name = "AES67 Device",
+        .Name = deviceConfig.name,
         .Manufacturer = "AES67 Driver",
-        .DeviceUID = "com.aes67.driver.device",
+        .DeviceUID = deviceConfig.uid,
+        // Deliberately shared across devices: ModelUID says what kind of
+        // hardware this is, not which one, and Core Audio groups devices by
+        // it. DeviceUID is the identity that must differ.
         .ModelUID = "com.aes67.driver.model",
         .CanBeDefault = true,
         .CanBeDefaultForSystemSounds = false,
@@ -40,8 +44,9 @@ AES67Device::AES67Device(std::shared_ptr<aspl::Context> context)
         // channels -- which contradicts the streams this device actually
         // builds, so the device reports a nominal rate it never uses.
         .SampleRate = static_cast<UInt32>(kDefaultSampleRate),
-        .ChannelCount = static_cast<UInt32>(kNumChannels)
+        .ChannelCount = deviceConfig.channelCount
     })
+    , deviceConfig_(std::move(deviceConfig))
     // Initialize ring buffers sized for maximum supported sample rate (384kHz)
     // This ensures buffers are always large enough regardless of sample rate changes
     // Power-of-2 sizing: 384kHz @ 3ms = 1152 samples → 2048 (next power of 2)
@@ -93,7 +98,13 @@ void AES67Device::Initialize() {
     // Initialize Stream Manager (manages all AES67 network streams)
     AES67_LOG("AES67Device: Creating StreamManager");
     streamManager_ = std::make_unique<StreamManager>(inputBuffers_, outputBuffers_);
-    AES67_LOG("AES67Device: StreamManager created successfully");
+    // Before loadSavedStreams(), or this device would claim every stream in
+    // the config including those belonging to its siblings.
+    streamManager_->setDeviceUID(deviceConfig_.uid,
+                                 deviceConfig_.adoptsUnassignedStreams);
+    AES67_LOGF("AES67Device: StreamManager created for device '%s' (uid=%s, %u channels)",
+               deviceConfig_.name.c_str(), deviceConfig_.uid.c_str(),
+               deviceConfig_.channelCount);
 
     // Set device sample rate in StreamManager
     streamManager_->setDeviceSampleRate(currentSampleRate_.load());
@@ -170,6 +181,11 @@ AES67Device::~AES67Device() {
 }
 
 void AES67Device::InitializeStreams() {
+    // What Core Audio is told the device has. The ring buffers behind it are
+    // always kNumChannels deep, so a stream mapped beyond this count still has
+    // somewhere to write -- it simply has no application-visible channel.
+    const UInt32 advertisedChannels = deviceConfig_.channelCount;
+
     AES67_LOG("InitializeStreams: Creating input stream (Network → Core Audio)");
     // Create input stream (Network → Core Audio)
     aspl::StreamParameters inputParams;
@@ -179,13 +195,13 @@ void AES67Device::InitializeStreams() {
     inputParams.Format.mFormatID = kAudioFormatLinearPCM;
     inputParams.Format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
     inputParams.Format.mBitsPerChannel = 32;
-    inputParams.Format.mChannelsPerFrame = kNumChannels;
-    inputParams.Format.mBytesPerFrame = kNumChannels * sizeof(float);
+    inputParams.Format.mChannelsPerFrame = advertisedChannels;
+    inputParams.Format.mBytesPerFrame = advertisedChannels * sizeof(float);
     inputParams.Format.mFramesPerPacket = 1;
     inputParams.Format.mBytesPerPacket = inputParams.Format.mBytesPerFrame;
 
     AES67_LOGF("InitializeStreams: Input stream - %u channels @ %.0f Hz",
-               kNumChannels, currentSampleRate_.load());
+               advertisedChannels, currentSampleRate_.load());
 
     inputStream_ = std::make_shared<aspl::Stream>(
         GetContext(),
@@ -205,13 +221,13 @@ void AES67Device::InitializeStreams() {
     outputParams.Format.mFormatID = kAudioFormatLinearPCM;
     outputParams.Format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
     outputParams.Format.mBitsPerChannel = 32;
-    outputParams.Format.mChannelsPerFrame = kNumChannels;
-    outputParams.Format.mBytesPerFrame = kNumChannels * sizeof(float);
+    outputParams.Format.mChannelsPerFrame = advertisedChannels;
+    outputParams.Format.mBytesPerFrame = advertisedChannels * sizeof(float);
     outputParams.Format.mFramesPerPacket = 1;
     outputParams.Format.mBytesPerPacket = outputParams.Format.mBytesPerFrame;
 
     AES67_LOGF("InitializeStreams: Output stream - %u channels @ %.0f Hz",
-               kNumChannels, currentSampleRate_.load());
+               advertisedChannels, currentSampleRate_.load());
 
     outputStream_ = std::make_shared<aspl::Stream>(
         GetContext(),
@@ -229,8 +245,9 @@ void AES67Device::InitializeIOHandler() {
     AES67_LOG("InitializeIOHandler: Creating AES67IOHandler with RTSafeStreamInterface");
     ioHandler_ = std::make_shared<AES67IOHandler>(
         *rtInterface_,
-        kNumChannels,           // Cache channel count for RT-safe access
-        sizeof(Float32)         // Cache bytes per sample for RT-safe access
+        deviceConfig_.channelCount,  // Must match what the streams advertise,
+                                     // or the handler rejects every IO cycle
+        sizeof(Float32)              // Cache bytes per sample for RT-safe access
     );
     AES67_LOG("InitializeIOHandler: IOHandler created successfully");
 
@@ -353,7 +370,10 @@ std::string AES67Device::GetDeviceManufacturer() const {
 }
 
 std::string AES67Device::GetDeviceUID() const {
-    return "com.aes67.driver.device";
+    // Must be the configured UID, not a constant: aspl::Plugin indexes its
+    // devices by UID, so two instances returning the same string leave only
+    // one of them reachable by lookup.
+    return deviceConfig_.uid;
 }
 
 //

@@ -40,7 +40,44 @@ struct PersistedStreamConfig {
     // Empty string = bind to INADDR_ANY (all interfaces).
     std::string networkInterface;
 
+    // Which Core Audio device this stream belongs to, matching AudioDeviceConfig::uid.
+    // Empty means the default device, which is also what every config written
+    // before devices existed says -- so those keep loading onto the single
+    // device they were written for.
+    std::string deviceUID;
+
     // Validation
+    bool isValid() const;
+};
+
+//
+// Published Core Audio Device
+//
+// One entry per device the plug-in publishes. Several small devices are not
+// the same thing as one device with many channels: ordinary macOS
+// applications -- Spotify, browsers, system sounds -- always play to the
+// first two channels of whichever device they are pointed at, and cannot be
+// told to use channels 3-4. Sending two applications to two different streams
+// therefore needs two devices, not one device with four channels.
+//
+struct AudioDeviceConfig {
+    // Shown in System Settings and Audio MIDI Setup.
+    std::string name{"AES67 Device"};
+
+    // Must be unique across devices: aspl::Plugin indexes devices by UID, and
+    // a duplicate silently replaces the earlier device in that index.
+    std::string uid{"com.aes67.driver.device"};
+
+    // Channels advertised to Core Audio, per direction. The ring buffers are
+    // always allocated for the maximum; this only limits what the device
+    // reports, which is what keeps a 2-channel device from appearing as 128.
+    uint32_t channelCount{128};
+
+    // Takes the streams that name no device at all. Set on the first entry, so
+    // adding a devices section to an existing config does not silently orphan
+    // every stream already in it -- they keep loading, onto the first device.
+    bool adoptsUnassignedStreams{false};
+
     bool isValid() const;
 };
 
@@ -100,11 +137,28 @@ public:
     // JSON Serialization
     //
 
-    // Convert stream configs to JSON string
-    static std::string toJSON(const std::vector<PersistedStreamConfig>& configs);
+    // Convert stream configs to JSON string.
+    //
+    // The devices are written back out with them: auto-save rewrites the whole
+    // file, so anything this function omits is destroyed on the first stream
+    // change. Callers that have devices must pass them.
+    static std::string toJSON(const std::vector<PersistedStreamConfig>& configs,
+                              const std::vector<AudioDeviceConfig>& devices = {});
 
     // Parse stream configs from JSON string
     static std::optional<std::vector<PersistedStreamConfig>> fromJSON(const std::string& json);
+
+    // Read the list of devices to publish.
+    //
+    // Returns a single default device when the config names none, so a file
+    // written before devices existed keeps producing exactly the device it
+    // used to. Never returns empty -- a plug-in with no device is useless, and
+    // silently publishing nothing is a far worse failure than ignoring a
+    // malformed devices section.
+    std::vector<AudioDeviceConfig> loadDevices();
+
+    // Parse the devices array out of a config document.
+    static std::vector<AudioDeviceConfig> devicesFromJSON(const std::string& json);
 
     // Convert single config to JSON object string
     static std::string configToJSON(const PersistedStreamConfig& config);

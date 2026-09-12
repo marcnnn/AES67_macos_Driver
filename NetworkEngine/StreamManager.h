@@ -139,6 +139,22 @@ public:
     // Configuration Persistence
     //
 
+    /// Restrict this manager to the streams belonging to one device.
+    ///
+    /// With several devices published, each has its own StreamManager reading
+    /// the same config file, so without a filter every device would claim
+    /// every stream -- and two transmitters on one multicast address is a
+    /// stream nobody can decode. Must be set before loadSavedStreams().
+    ///
+    /// @param adoptUnassigned Also take streams that name no device. Exactly
+    ///        one device should set this, or a stream without a device lands
+    ///        on several at once.
+    void setDeviceUID(const std::string& uid, bool adoptUnassigned = false) {
+        deviceUID_ = uid;
+        adoptsUnassigned_ = adoptUnassigned;
+    }
+    const std::string& getDeviceUID() const { return deviceUID_; }
+
     /// Load saved stream configurations from /tmp/AES67Driver/streams.json.
     bool loadSavedStreams();
 
@@ -213,6 +229,10 @@ private:
     // Data members
     DeviceChannelBuffers& inputChannels_;   // RTP receivers write here (Network → Core Audio)
     DeviceChannelBuffers& outputChannels_;  // RTP transmitters read here (Core Audio → Network)
+
+    // Which device's streams this manager owns; see setDeviceUID().
+    std::string deviceUID_;
+    bool adoptsUnassigned_{true};
     StreamChannelMapper mapper_;
     std::map<StreamID, ManagedStream> streams_;
     mutable std::mutex streamsMutex_;

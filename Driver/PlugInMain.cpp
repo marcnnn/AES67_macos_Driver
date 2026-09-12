@@ -6,10 +6,12 @@
 
 #include "AES67Device.h"
 #include "DebugLog.h"
+#include "ProcessActivity.h"
 #include <aspl/Plugin.hpp>
 #include <aspl/Driver.hpp>
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <memory>
+#include <vector>
 
 namespace AES67 {
 
@@ -24,20 +26,34 @@ public:
     explicit AES67Plugin(std::shared_ptr<aspl::Context> context)
         : aspl::Plugin(context)
     {
-        AES67_LOG("AES67Plugin constructor: Creating AES67Device...");
-        // Create the AES67 audio device
-        device_ = std::make_shared<AES67Device>(context);
-        AES67_LOG("AES67Plugin constructor: Device created successfully");
+        // One Core Audio device per entry in the config's devices section.
+        //
+        // Several small devices are not interchangeable with one wide device:
+        // ordinary macOS applications always play to the first two channels of
+        // whichever device they are pointed at and cannot be told to use
+        // channels 3-4, so routing two applications to two different streams
+        // needs two devices. loadDevices() never returns empty -- absent a
+        // devices section it yields the single default device this driver
+        // published before the section existed.
+        StreamConfigManager configManager;
+        const auto deviceConfigs = configManager.loadDevices();
 
-        AES67_LOG("AES67Plugin constructor: Initializing device...");
-        // Initialize device (now that shared_ptr is fully constructed)
-        device_->Initialize();
-        AES67_LOG("AES67Plugin constructor: Device initialized successfully");
+        AES67_LOGF("AES67Plugin constructor: creating %zu device(s)", deviceConfigs.size());
 
-        AES67_LOG("AES67Plugin constructor: Registering device with plugin...");
-        // Register device with the plugin
-        AddDevice(device_);
-        AES67_LOG("AES67Plugin constructor: Device registered successfully");
+        for (const auto& deviceConfig : deviceConfigs) {
+            auto device = std::make_shared<AES67Device>(context, deviceConfig);
+
+            // Initialize after the shared_ptr exists: InitializeStreams() uses
+            // shared_from_this(), which is not valid inside the constructor.
+            device->Initialize();
+
+            AddDevice(device);
+            ownedDevices_.push_back(device);
+
+            AES67_LOGF("AES67Plugin constructor: registered device '%s' (uid=%s, %u channels)",
+                       deviceConfig.name.c_str(), deviceConfig.uid.c_str(),
+                       deviceConfig.channelCount);
+        }
     }
 
     std::string GetManufacturer() const override {
@@ -45,7 +61,9 @@ public:
     }
 
 private:
-    std::shared_ptr<AES67Device> device_;
+    // Held so the devices outlive the plug-in registration; aspl::Plugin keeps
+    // its own references, this is ownership on our side.
+    std::vector<std::shared_ptr<AES67Device>> ownedDevices_;
 };
 
 } // namespace AES67
@@ -59,6 +77,10 @@ extern "C" {
 // Plugin entry point called by Core Audio
 void* Create() {
     AES67_LOG("=== AES67 Driver Create() called ===");
+
+    // Before anything else: transmit pacing depends on this process not being
+    // treated as idle. See ProcessActivity.h.
+    AES67::BeginLatencyCriticalActivity();
 
     try {
         AES67_LOG("Step 1: Creating ASPL context...");
