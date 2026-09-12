@@ -443,8 +443,11 @@ private:
     // there are too few samples for the fit to mean anything.
     bool estimateFrequencyPpb(double& ppbOut) const;
 
-    // Offset filtering — simple moving average
-    static constexpr size_t kOffsetFilterSize = 8;
+    // Offset filtering.
+    //
+    // Two estimators over one window, chosen by whether a path delay
+    // measurement exists. See calculateOffsetAndDelay() for why.
+    static constexpr size_t kOffsetFilterSize = 16;
     std::array<int64_t, kOffsetFilterSize> offsetHistory_;
     size_t offsetHistoryIndex_{0};
     size_t offsetHistoryCount_{0};

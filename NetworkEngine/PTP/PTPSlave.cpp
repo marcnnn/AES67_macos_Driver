@@ -1223,22 +1223,51 @@ void PTPSlave::calculateOffsetAndDelay() {
         offset = static_cast<int64_t>(normalised);
     }
 
-    // Filter offset (moving average)
     offsetHistory_[offsetHistoryIndex_] = offset;
     offsetHistoryIndex_ = (offsetHistoryIndex_ + 1) % kOffsetFilterSize;
     if (offsetHistoryCount_ < kOffsetFilterSize) offsetHistoryCount_++;
 
-    // Compute filtered offset (average). Sum the deviations from the first
-    // sample rather than the samples themselves: with epoch normalisation
-    // disabled the raw values can be ~1e18ns, and summing eight of those
-    // overflows int64 and flips the sign of the result.
-    const int64_t offsetRef = offsetHistory_[0];
-    int64_t offsetAcc = 0;
-    for (size_t i = 0; i < offsetHistoryCount_; ++i) {
-        offsetAcc += offsetHistory_[i] - offsetRef;
+    int64_t filteredOffset;
+
+    if (haveDelay) {
+        // With a measured path delay the offset is already delay-corrected and
+        // the residual error is roughly symmetric, so average it. Sum the
+        // deviations from the first sample rather than the samples themselves:
+        // with epoch normalisation disabled the raw values can be ~1e18ns, and
+        // summing a windowful of those overflows int64 and flips the sign.
+        const int64_t offsetRef = offsetHistory_[0];
+        int64_t offsetAcc = 0;
+        for (size_t i = 0; i < offsetHistoryCount_; ++i) {
+            offsetAcc += offsetHistory_[i] - offsetRef;
+        }
+        filteredOffset =
+            offsetRef + offsetAcc / static_cast<int64_t>(offsetHistoryCount_);
+    } else {
+        // No Delay_Resp, so this offset is (t2 - t1) and carries the entire
+        // master-to-slave transit, queuing included. Queuing only ever *adds*
+        // delay, so the error is one-sided and averaging it is the wrong move:
+        // the mean chases every congested Sync, and that wander goes into the
+        // media clock, out through the send schedule, and reaches a receiver
+        // as a latency tail that grows and shrinks while our packet cadence
+        // stays metronomic. The least-delayed sample in the window is the best
+        // available estimate. This is the same argument the path delay filter
+        // below already makes, applied to the quantity that is actually
+        // carrying the transit here.
+        //
+        // What is left is a constant bias of one minimum transit -- which just
+        // shifts a receiver's average latency, and is the known limitation of
+        // running without Delay_Resp. Trading varying error for constant error
+        // is the whole point: the variance is what pushes packets past a
+        // receiver's threshold, not the mean.
+        //
+        // The window has to expire, hence a circular buffer rather than a
+        // running minimum: our clock drifts against the master, so a stale
+        // sample would drag the estimate further off the longer it was kept.
+        filteredOffset = offsetHistory_[0];
+        for (size_t i = 1; i < offsetHistoryCount_; ++i) {
+            filteredOffset = std::min(filteredOffset, offsetHistory_[i]);
+        }
     }
-    int64_t filteredOffset =
-        offsetRef + offsetAcc / static_cast<int64_t>(offsetHistoryCount_);
 
     // Run the servo on the filtered measurement. What callers see as the
     // offset is the residual the servo has not yet corrected for; with the
