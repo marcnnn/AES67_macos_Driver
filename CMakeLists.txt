@@ -166,6 +166,7 @@ if(APPLE)
     add_library(AES67Driver MODULE
         ${ALL_CPP_SOURCES}
         Driver/PlugInMain.cpp  # AudioServerPlugIn entry point
+        Driver/ProcessActivity.mm  # driver-only: needs Foundation
     )
 
     target_include_directories(AES67Driver PRIVATE
@@ -179,6 +180,7 @@ if(APPLE)
         "-framework CoreAudio"
         "-framework CoreFoundation"
         "-framework AudioToolbox"
+        "-framework Foundation"
     )
 
     # Bundle properties

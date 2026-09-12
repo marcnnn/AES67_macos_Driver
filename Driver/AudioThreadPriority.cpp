@@ -1,4 +1,5 @@
 #include "AudioThreadPriority.h"
+#include "DebugLog.h"
 #include <mach/mach.h>
 #include <mach/mach_error.h>
 #include <mach/thread_policy.h>
@@ -20,6 +21,29 @@ bool AudioThreadPriority::configureForRealTime() {
 
 bool AudioThreadPriority::configureForRealTimePeriodic(uint64_t periodNs,
                                                        uint64_t computationNs) {
+    // Leave Darwin background before asking for anything else.
+    //
+    // A background-classified thread has its timer deadlines coalesced against
+    // kern.timer_coalesce_bg_ns_max, which is 100ms, and the classification is
+    // what the kernel consults -- not the latency tier requested further down,
+    // whose own envelope (kern.timer_coalesce_tier0_ns_max) is 1ms. That gap is
+    // the whole symptom: a 1ms send cadence leaves the wire as bursts of a
+    // dozen packets with stalls of 15-37ms between them, the average rate
+    // staying exactly right because the loop catches up. Deadline scheduling
+    // and a latency-critical process activity were both tried first and
+    // neither moved it, because neither changes this classification.
+    //
+    // Clearing it at process level as well as thread level is deliberate: the
+    // transmit thread is created from whichever thread configured the stream,
+    // and inherits the process default.
+    const int threadBgBefore  = getpriority(PRIO_DARWIN_THREAD, 0);
+    const int processBgBefore = getpriority(PRIO_DARWIN_PROCESS, 0);
+    setpriority(PRIO_DARWIN_THREAD, 0, 0);
+    setpriority(PRIO_DARWIN_PROCESS, 0, 0);
+    AES67_LOGF("AudioThreadPriority: darwin background thread %d->%d process %d->%d",
+               threadBgBefore, getpriority(PRIO_DARWIN_THREAD, 0),
+               processBgBefore, getpriority(PRIO_DARWIN_PROCESS, 0));
+
     // Start from the existing configuration so the thread is also taken out of
     // the timeshare class; the time-constraint policy below is what actually
     // gets it scheduled on a deadline.
@@ -57,8 +81,46 @@ bool AudioThreadPriority::configureForRealTimePeriodic(uint64_t periodNs,
         fprintf(stderr, "AES67 AudioThreadPriority: THREAD_TIME_CONSTRAINT_POLICY "
                         "failed (kern_return=%d: %s)\n",
                 result, mach_error_string(result));
+        AES67_LOGF("AudioThreadPriority: THREAD_TIME_CONSTRAINT_POLICY failed (%d: %s)",
+                   result, mach_error_string(result));
         return false;
     }
+
+    // Opt out of timer coalescing.
+    //
+    // macOS batches timer wakeups for threads it considers idle, to save power.
+    // Inside a host process that is doing nothing else -- coreaudiod with no
+    // application using the device -- that turns a steady 1ms cadence into
+    // bursts separated by 30ms stalls, which measured as 2094 packet gaps over
+    // 2ms in 30 seconds. Requesting the lowest latency tier asks the scheduler
+    // to wake this thread on time rather than when convenient.
+    thread_latency_qos_policy_data_t latencyPolicy;
+    latencyPolicy.thread_latency_qos_tier = LATENCY_QOS_TIER_0;
+    thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                      THREAD_LATENCY_QOS_POLICY,
+                      reinterpret_cast<thread_policy_t>(&latencyPolicy),
+                      THREAD_LATENCY_QOS_POLICY_COUNT);
+
+    // Read the tier back. Requesting it is not the same as getting it, and
+    // the difference between tier 0 and the background envelope is 1ms versus
+    // 100ms of permitted slop.
+    thread_latency_qos_policy_data_t readBack{};
+    mach_msg_type_number_t readBackCount = THREAD_LATENCY_QOS_POLICY_COUNT;
+    boolean_t getDefault = FALSE;
+    if (thread_policy_get(pthread_mach_thread_np(pthread_self()),
+                          THREAD_LATENCY_QOS_POLICY,
+                          reinterpret_cast<thread_policy_t>(&readBack),
+                          &readBackCount, &getDefault) == KERN_SUCCESS) {
+        AES67_LOGF("AudioThreadPriority: latency qos tier requested 0, reads back %u",
+                   (unsigned)readBack.thread_latency_qos_tier);
+    }
+
+    thread_throughput_qos_policy_data_t throughputPolicy;
+    throughputPolicy.thread_throughput_qos_tier = THROUGHPUT_QOS_TIER_0;
+    thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                      THREAD_THROUGHPUT_QOS_POLICY,
+                      reinterpret_cast<thread_policy_t>(&throughputPolicy),
+                      THREAD_THROUGHPUT_QOS_POLICY_COUNT);
 
     return true;
 }
