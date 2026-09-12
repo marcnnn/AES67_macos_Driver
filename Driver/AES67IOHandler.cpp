@@ -94,6 +94,38 @@ void AES67IOHandler::OnWriteClientOutput(
     (void)timestamp;
 }
 
+void AES67IOHandler::OnWriteMixedOutput(
+    const std::shared_ptr<aspl::Stream>& stream,
+    Float64 zeroTimestamp,
+    Float64 timestamp,
+    const void* bytes,
+    UInt32 bytesCount
+) {
+    // RT-SAFE: Write to ring buffers (Core Audio → Network)
+    //
+    // The mix of every client that has the device open, in the stream's native
+    // format -- 32-bit float interleaved, same as OnReadClientInput receives.
+    // Raw bytes rather than frames here, so the frame count has to be derived.
+
+    if (!bytes) {
+        return;
+    }
+
+    const UInt32 channelCount = cachedChannelCount_;
+    const UInt32 bytesPerFrame = cachedBytesPerFrame_;
+    const UInt32 frameCount = (bytesPerFrame > 0) ? (bytesCount / bytesPerFrame) : 0;
+
+    if (frameCount == 0 || channelCount > kNumChannels) {
+        return;
+    }
+
+    processOutput(static_cast<const float*>(bytes), frameCount, channelCount);
+
+    (void)stream;
+    (void)zeroTimestamp;
+    (void)timestamp;
+}
+
 void AES67IOHandler::processInput(float* outputData, UInt32 frameCount, UInt32 channelCount) noexcept {
     // RT-SAFE: Read from input ring buffers (Network → Core Audio)
     // Network threads write to inputBuffers_

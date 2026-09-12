@@ -70,6 +70,11 @@ public:
 
     // Called when Core Audio has output data for device
     // Writes Float32 frames to outputBuffers_
+    //
+    // Only ever called when DeviceParameters::EnableMixing is false, which is
+    // not the default -- see OnWriteMixedOutput below. Kept so the handler
+    // still works if mixing is ever turned off, in which case the HAL delivers
+    // each client separately and this is the hook that fires.
     void OnWriteClientOutput(
         const std::shared_ptr<aspl::Client>& client,
         const std::shared_ptr<aspl::Stream>& stream,
@@ -78,6 +83,21 @@ public:
         const Float32* frames,
         UInt32 frameCount,
         UInt32 channelCount
+    ) override;
+
+    // Called with the mix of all clients. This is the hook that actually fires
+    // in this driver: libASPL's DeviceParameters::EnableMixing defaults to
+    // true, and WillDoIOOperationImpl() then declines kAudioServerPlugInIO-
+    // OperationMixOutput entirely, so OnWriteClientOutput() above is never
+    // reached. Implementing only that one is a silent failure -- the device
+    // opens, the transmit thread paces correctly, and every packet carries
+    // digital silence because nothing ever fills the output ring buffers.
+    void OnWriteMixedOutput(
+        const std::shared_ptr<aspl::Stream>& stream,
+        Float64 zeroTimestamp,
+        Float64 timestamp,
+        const void* bytes,
+        UInt32 bytesCount
     ) override;
 
 private:
