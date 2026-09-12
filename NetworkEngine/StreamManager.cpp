@@ -303,9 +303,9 @@ StreamID StreamManager::createTxStream(
         return StreamID::null();
     }
 
-    // Only start transmitter if IO is active (a Core Audio client has called StartIO).
-    // Otherwise the stream is created dormant and will be started by setIOActive(true).
-    if (ioActive_.load()) {
+    // Start transmitting now, regardless of IO: the stream is advertised from
+    // this point, and a subscriber must find audio actually flowing.
+    {
         if (!managed.transmitter->start()) {
             AES67_LOGF("StreamManager::createTxStream: failed to start RTP transmitter for '%s' (%s:%u)",
                        name.c_str(), multicastIP.c_str(), port);
@@ -495,29 +495,28 @@ void StreamManager::setIOActive(bool active) {
         return; // No state change
     }
 
+    // Only receivers follow the IO lifecycle. There is no point decoding audio
+    // into ring buffers nobody is reading, and no receiver on the network
+    // depends on us doing it.
+    //
+    // Transmitters deliberately do not: they run whenever a transmit stream is
+    // configured. A stream has to be both advertised and actually flowing to
+    // be usable -- advertising one that stops the moment no application has
+    // the device open just offers subscribers a stream that is not there. AES67
+    // also expects continuous packet flow so a receiver can recover the clock,
+    // which is why the transmitter already sends silence on an empty buffer.
     if (active) {
-        AES67_LOGF("StreamManager::setIOActive: Starting %zu stream(s)", streams_.size());
+        AES67_LOGF("StreamManager::setIOActive: Starting %zu receiver(s)", streams_.size());
         for (auto& [id, managed] : streams_) {
             if (managed.receiver) {
                 managed.receiver->start();
             }
-            if (managed.transmitter) {
-                managed.transmitter->start();
-            }
         }
     } else {
-        AES67_LOGF("StreamManager::setIOActive: Stopping %zu stream(s)", streams_.size());
-        // Announcements deliberately keep running here. A receiver has to be
-        // able to see a transmit stream in order to route it, and nothing will
-        // have the device open at that moment -- tying advertisement to the IO
-        // lifecycle made the stream invisible exactly when someone wanted to
-        // subscribe. Real AES67 hardware advertises continuously.
+        AES67_LOG("StreamManager::setIOActive: Stopping receiver(s)");
         for (auto& [id, managed] : streams_) {
             if (managed.receiver) {
                 managed.receiver->stop();
-            }
-            if (managed.transmitter) {
-                managed.transmitter->stop();
             }
         }
     }
@@ -858,7 +857,9 @@ bool StreamManager::loadSavedStreams() {
                 failedCount++;
                 continue;
             }
-            if (ioActive_.load() && !managed.transmitter->start()) {
+            // Start immediately: a restored transmit stream is advertised from
+            // load, so it has to be flowing from load too.
+            if (!managed.transmitter->start()) {
                 mapper_.removeMapping(id);
                 failedCount++;
                 continue;
