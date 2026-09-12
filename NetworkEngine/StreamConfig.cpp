@@ -429,7 +429,15 @@ std::string StreamConfigManager::mappingToJSON(const ChannelMapping& mapping) {
         json << mapping.channelMap[i];
     }
 
+    json << "],\n";
+
+    json << "        \"channelNames\": [";
+    for (size_t i = 0; i < mapping.channelNames.size(); i++) {
+        if (i > 0) json << ", ";
+        json << "\"" << escapeJSON(mapping.channelNames[i]) << "\"";
+    }
     json << "]\n";
+
     json << "      }";
 
     return json.str();
@@ -649,6 +657,22 @@ std::optional<ChannelMapping> StreamConfigManager::mappingFromJSON(const std::st
     if (auto val = extractUInt16Field(json, "streamChannelOffset")) mapping.streamChannelOffset = *val;
     if (auto val = extractUInt16Field(json, "deviceChannelStart")) mapping.deviceChannelStart = *val;
     if (auto val = extractUInt16Field(json, "deviceChannelCount")) mapping.deviceChannelCount = *val;
+
+    // Parse channelNames array
+    std::regex namesRegex(R"("channelNames"\s*:\s*\[([^\]]*)\])");
+    std::smatch namesMatch;
+    if (std::regex_search(json, namesMatch, namesRegex)) {
+        const std::string arrayContent = namesMatch[1].str();
+        // Custom delimiter: the pattern itself contains )" , which would
+        // otherwise close the raw string in the middle of the regex.
+        std::regex stringRegex(R"RX("([^"]*)")RX");
+        std::sregex_iterator it(arrayContent.begin(), arrayContent.end(), stringRegex);
+        const std::sregex_iterator end;
+        while (it != end) {
+            mapping.channelNames.push_back((*it)[1].str());
+            ++it;
+        }
+    }
 
     // Parse channelMap array
     std::regex arrayRegex(R"("channelMap"\s*:\s*\[([^\]]*)\])");

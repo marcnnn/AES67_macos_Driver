@@ -35,6 +35,18 @@ struct ChannelMapping {
     /// Per-channel custom routing. If empty, sequential: streamCh[i] -> deviceCh[start+i].
     std::vector<int> channelMap;
 
+    /// Display names for the stream's channels, in stream channel order.
+    ///
+    /// Announced in the SDP `i=` line in Audinate's format
+    /// ("2 channels: 01 Left, 02 Right"), which is the only place AES67 has
+    /// for them -- SDP has no field for naming individual channels, so this is
+    /// convention rather than protocol. Dante Controller does **not** display
+    /// them (verified on the wire with a marker name), but other AES67
+    /// receivers do read the field, so it is worth filling.
+    ///
+    /// Empty leaves whatever SDPSession::sessionInfo already holds untouched.
+    std::vector<std::string> channelNames;
+
     // Validation
     bool isValid() const;
     std::string getValidationError() const;

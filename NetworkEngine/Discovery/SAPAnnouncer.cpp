@@ -59,6 +59,46 @@ uint16_t hashSDP(const std::string& sdp) {
     return folded == 0 ? 1 : folded;  // 0 is reserved for "no hash"
 }
 
+/// This machine's short host name, for qualifying session names.
+///
+/// Read once: gethostname() is cheap but this runs per announcement, and the
+/// name cannot change meaningfully mid-session anyway -- receivers key their
+/// session identity off the name, so a rename mid-flight would present as a
+/// different stream regardless.
+///
+/// The trailing domain is dropped: "Mac-mini-von-EVT.local" is the same
+/// machine as "Mac-mini-von-EVT", and Dante device names carry no domain
+/// either.
+const std::string& localHostName() {
+    static const std::string name = [] {
+        char buf[256] = {};
+        if (::gethostname(buf, sizeof(buf) - 1) != 0) {
+            return std::string{};
+        }
+        std::string host(buf);
+        const size_t dot = host.find('.');
+        return dot == std::string::npos ? host : host.substr(0, dot);
+    }();
+    return name;
+}
+
+/// Prefix a session name with this machine, the way Dante devices do
+/// ("W-1-RegieOben : 32"), so several senders on a network stay tellable apart
+/// without anyone having to write the machine name into every config by hand.
+///
+/// Left alone when the configured name already starts with the host name,
+/// which is both the opt-out and what keeps a restart from prefixing twice.
+std::string qualifiedSessionName(const std::string& configured) {
+    const std::string& host = localHostName();
+    if (host.empty() || configured.empty()) {
+        return configured;
+    }
+    if (configured.rfind(host, 0) == 0) {
+        return configured;
+    }
+    return host + " : " + configured;
+}
+
 /// The o= line identifies the session, and receivers key off it: same id means
 /// "this is that session again", a different id means "this is a new one".
 ///
@@ -223,6 +263,10 @@ private:
     std::string buildSDP(const SDPSession& sdp) const {
         SDPSession announced = sdp;
         announced.direction = "recvonly";
+        // Before the id is derived below: the name is part of what identifies
+        // the session, so qualifying it afterwards would announce a name that
+        // does not match its own id.
+        announced.sessionName = qualifiedSessionName(announced.sessionName);
         if (announced.originAddress.empty()) {
             announced.originAddress = sourceAddress_;
         }

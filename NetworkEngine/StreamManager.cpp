@@ -14,6 +14,49 @@
 
 namespace AES67 {
 
+namespace {
+
+/// Render channel names into the SDP `i=` line, in the format Dante senders
+/// use: "8 channels: 01 SIA Zone 01, 02 SIA Zone 02, ...".
+///
+/// This is the only place AES67 offers for channel names -- SDP has no field
+/// for naming individual channels of a multichannel stream, so `i=` (free-text
+/// session information) carries them by convention. Dante Controller does not
+/// display them; verified 2026-09-11 by announcing a marker name and finding it
+/// nowhere in its UI. Other AES67 receivers do read the field, and it costs
+/// nothing to be correct here, so the names are announced anyway.
+///
+/// Numbering is 1-based and zero-padded to two digits to match what Dante
+/// emits, since anything parsing this is parsing Dante's format.
+std::string formatChannelNamesForSDP(const std::vector<std::string>& names) {
+    if (names.empty()) {
+        return {};
+    }
+
+    std::ostringstream info;
+    info << names.size() << " channels:";
+    for (size_t i = 0; i < names.size(); i++) {
+        info << (i == 0 ? " " : ", ")
+             << (i + 1 < 10 ? "0" : "") << (i + 1) << " " << names[i];
+    }
+    return info.str();
+}
+
+/// Apply channel names to a session description, if any are configured.
+///
+/// Names win over a hand-written sessionInfo: they are the structured field, so
+/// a config carrying both means someone set the names and left the old free
+/// text behind. Leaving sessionInfo alone when there are no names keeps
+/// existing configs announcing exactly what they did before.
+void applyChannelNames(SDPSession& sdp, const ChannelMapping& mapping) {
+    const std::string info = formatChannelNamesForSDP(mapping.channelNames);
+    if (!info.empty()) {
+        sdp.sessionInfo = info;
+    }
+}
+
+} // namespace
+
 StreamManager::StreamManager(DeviceChannelBuffers& inputChannels, DeviceChannelBuffers& outputChannels)
     : inputChannels_(inputChannels)
     , outputChannels_(outputChannels)
@@ -81,6 +124,7 @@ StreamID StreamManager::addStream(const SDPSession& sdp, const ChannelMapping& m
     // Create managed stream
     ManagedStream managed;
     managed.sdp = sdp;
+    applyChannelNames(managed.sdp, completeMapping);
     managed.mapping = completeMapping;
     managed.isTransmit = false;
 
@@ -851,6 +895,9 @@ bool StreamManager::loadSavedStreams() {
         // Create managed stream
         ManagedStream managed;
         managed.sdp = config.sdp;
+        // Before anything announces or transmits this session: the names are
+        // part of the description receivers get, not an afterthought.
+        applyChannelNames(managed.sdp, loadedMapping);
         managed.mapping = loadedMapping;
         managed.isTransmit = isTransmit;
         // Needed by the SAP announcer to advertise from the same interface the
