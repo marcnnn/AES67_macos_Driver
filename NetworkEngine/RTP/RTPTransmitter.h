@@ -94,6 +94,12 @@ public:
     /// unaffected -- they still name the sampling instant -- so the audio
     /// stays correctly placed in time, it simply leaves sooner.
     ///
+    /// Defaults to zero: packets leave at the instant their timestamp names.
+    /// Raising it buys margin against clock wander -- a packet sent early has
+    /// further to travel before a receiver calls it late -- but it spends the
+    /// *receiver's* buffer to do so, and at a 2ms setting there is not much of
+    /// it. Raise it only against a receiver known to have the headroom.
+    ///
     /// Must be set before start().
     void setSendAhead(std::chrono::microseconds ahead) { sendAhead_ = ahead; }
     std::chrono::microseconds getSendAhead() const { return sendAhead_; }
@@ -148,7 +154,7 @@ private:
 
     // Default to one packet interval: enough to matter to a receiver with a
     // tight link offset, small enough not to eat meaningfully into buffering.
-    std::chrono::microseconds sendAhead_{1000};
+    std::chrono::microseconds sendAhead_{0};
 
     // Full-width media clock position of the next packet. timestamp_ is this
     // truncated to 32 bits; this is kept separately so the send schedule can be

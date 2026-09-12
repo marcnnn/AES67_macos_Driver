@@ -189,6 +189,8 @@ void RTPTransmitter::transmitLoop() {
 
     const uint64_t sendAheadNs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(sendAhead_).count());
+    const uint64_t packetIntervalNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(packetInterval_).count());
 
     // How often to check the schedule against the media clock. Every packet is
     // too often -- it is the clock's noise that would be tracked, not its rate.
@@ -244,8 +246,19 @@ void RTPTransmitter::transmitLoop() {
                 const uint64_t nowNs = mediaClockSource_();
                 if (nowNs != 0) {
                     // Where the media clock should be as this packet goes out.
+                    //
+                    // The clock is read here, at the top of the loop, but the
+                    // packet does not leave until after the sleep below -- one
+                    // packet interval later. Comparing a reading taken now
+                    // against where the clock should be at departure is off by
+                    // exactly that interval, and since it was also the default
+                    // send-ahead, the two cancelled: setSendAhead() had no
+                    // effect on when packets actually left. Measured on the
+                    // wire, departure sat within 21us of the timestamp instant
+                    // with a nominal 1ms of send-ahead configured.
                     const int64_t idealNs = static_cast<int64_t>(mediaTicksToNs(mediaTicks_)) -
-                                            static_cast<int64_t>(sendAheadNs);
+                                            static_cast<int64_t>(sendAheadNs) -
+                                            static_cast<int64_t>(packetIntervalNs);
                     const int64_t errorNs = static_cast<int64_t>(nowNs) - idealNs;
 
                     if (resyncToMediaClock || errorNs > kMediaSnapThresholdNs ||
