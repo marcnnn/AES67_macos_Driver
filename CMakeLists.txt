@@ -195,6 +195,19 @@ if(APPLE)
         OSX_DEPLOYMENT_TARGET "13.0"
     )
 
+    # coreaudiod is hardened and validates the plug-in bundle's signature before
+    # loading it. CMake only linker-signs the executable, which leaves the bundle
+    # with no _CodeSignature: codesign then reports "code has no resources but
+    # signature indicates they must be present" and coreaudiod silently declines to
+    # call Create() -- no device appears and nothing is transmitted. Re-sign the
+    # whole bundle so the Info.plist and resources are sealed.
+    add_custom_command(TARGET AES67Driver POST_BUILD
+        COMMAND codesign --force --sign - --timestamp=none "$<TARGET_BUNDLE_DIR:AES67Driver>"
+        COMMAND codesign --verify --verbose=2 "$<TARGET_BUNDLE_DIR:AES67Driver>"
+        COMMENT "Ad-hoc signing AES67Driver.driver bundle"
+        VERBATIM
+    )
+
     # Install to standard location
     install(TARGETS AES67Driver
         LIBRARY DESTINATION "/Library/Audio/Plug-Ins/HAL"
